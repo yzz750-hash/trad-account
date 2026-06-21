@@ -1,0 +1,79 @@
+﻿version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-traduser}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:-tradaccount}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-traduser} -d ${POSTGRES_DB:-tradaccount}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT:-8004}:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://traduser:tradpass@db:5432/tradaccount}
+      JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      REDIS_URL: redis://redis:6379/0
+    secrets:
+      - jwt_secret_key
+      - encryption_key
+      - deepseek_api_key
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+secrets:
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key.txt
+  encryption_key:
+    file: ./secrets/encryption_key.txt
+  deepseek_api_key:
+    file: ./secrets/deepseek_api_key.txt
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

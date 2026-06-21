@@ -1,0 +1,834 @@
+openapi: "3.0.3"
+info:
+  title: Intelligent Foreign Trade Financial API
+  description: |
+    API for the China foreign trade financial software (智能外贸财务系统).
+    Features: AI-powered voucher generation, multi-ledger accounting, period closing,
+    OEM commission calculation, print & export, audit trail.
+
+    **Auth:** JWT Bearer token in `Authorization` header. CSRF via `X-CSRF-Token`.
+    **Multi-ledger:** Pass `X-Ledger-Id` header to scope all operations to a ledger.
+  version: "1.0.0"
+  contact:
+    name: Trad Account Team
+
+servers:
+  - url: http://localhost:8004
+    description: Local development (8000-8003 blocked by zombie ports on Windows)
+
+tags:
+  - name: Auth
+    description: Authentication & user management
+  - name: Ledgers
+    description: Multi-ledger (账套) management
+  - name: Accounts
+    description: Chart of accounts (科目) — hierarchical, supports 小企业会计准则
+  - name: Partners
+    description: Business partners (客户/供应商)
+  - name: Vouchers
+    description: Accounting vouchers (凭证) — CRUD + AI generation + OCR upload
+  - name: Reports
+    description: Financial reports — balance sheet, income statement, cash flow, subsidiary, OEM, commission
+  - name: Closing
+    description: Period-end closing — depreciation, profit carry-forward, reversal
+  - name: Tax
+    description: Tax rates & VAT records (进项/销项/出口退税)
+  - name: Export
+    description: Excel & PDF export
+  - name: AI
+    description: AI chat for natural-language account management
+  - name: System
+    description: Health check, audit logs, backups
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    # --- Auth ---
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+    LoginResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: bearer }
+        user: { $ref: '#/components/schemas/User' }
+    RegisterRequest:
+      type: object
+      required: [username, password, role]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password, minLength: 8 }
+        role: { type: string, enum: [admin, accountant, auditor] }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        role: { type: string }
+        is_active: { type: boolean }
+        last_login: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    # --- Ledger ---
+    LedgerCreate:
+      type: object
+      required: [name, start_year, start_month]
+      properties:
+        name: { type: string, description: 账套名称 }
+        company_name: { type: string, description: 公司全称 }
+        base_currency: { type: string, default: CNY }
+        start_year: { type: integer }
+        start_month: { type: integer }
+        llm_provider: { type: string, default: deepseek }
+        llm_api_key: { type: string }
+        llm_base_url: { type: string }
+        llm_model_name: { type: string, default: deepseek-chat }
+    Ledger:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        company_name: { type: string }
+        base_currency: { type: string }
+        start_year: { type: integer }
+        start_month: { type: integer }
+        is_active: { type: boolean }
+        llm_provider: { type: string }
+        llm_model_name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    # --- Account ---
+    AccountCreate:
+      type: object
+      required: [code, name, account_type, balance_direction]
+      properties:
+        code: { type: string, description: 科目编码, example: "1001" }
+        name: { type: string, description: 科目名称, example: "库存现金" }
+        parent_id: { type: integer, nullable: true }
+        account_type: { type: string, enum: [ASSET, LIABILITY, EQUITY, COST, PROFIT_LOSS] }
+        balance_direction: { type: string, enum: [DEBIT, CREDIT] }
+        opening_balance: { type: number, default: 0.00 }
+        is_active: { type: boolean, default: true }
+    Account:
+      type: object
+      properties:
+        id: { type: integer }
+        ledger_id: { type: integer }
+        code: { type: string }
+        name: { type: string }
+        parent_id: { type: integer, nullable: true }
+        account_type: { type: string }
+        balance_direction: { type: string }
+        opening_balance: { type: number }
+        is_active: { type: boolean }
+        children: { type: array, items: { $ref: '#/components/schemas/Account' } }
+
+    # --- Partner ---
+    PartnerCreate:
+      type: object
+      required: [code, name, partner_type]
+      properties:
+        code: { type: string, description: 往来单位编码 }
+        name: { type: string, description: 往来单位名称 }
+        partner_type: { type: string, enum: [CUSTOMER, VENDOR, BOTH] }
+        is_active: { type: boolean, default: true }
+    Partner:
+      type: object
+      properties:
+        id: { type: integer }
+        ledger_id: { type: integer }
+        code: { type: string }
+        name: { type: string }
+        partner_type: { type: string }
+        is_active: { type: boolean }
+
+    # --- Voucher ---
+    VoucherEntrySchema:
+      type: object
+      required: [account_code, summary, direction, amount]
+      properties:
+        account_code: { type: string }
+        summary: { type: string, description: 摘要 }
+        direction: { type: string, enum: ["借", "贷"] }
+        amount: { type: number, exclusiveMinimum: 0 }
+        currency_code: { type: string, default: CNY }
+        original_amount: { type: number, nullable: true }
+        exchange_rate: { type: number, default: 1.0000 }
+        partner_id: { type: integer, nullable: true }
+    VoucherCreate:
+      type: object
+      required: [voucher_date, entries]
+      properties:
+        voucher_date: { type: string, format: date }
+        voucher_number: { type: string, description: 凭证字号, auto-generated if omitted }
+        attachments_count: { type: integer, default: 0 }
+        contract_number: { type: string, nullable: true, description: OEM合同号 }
+        entries: { type: array, items: { $ref: '#/components/schemas/VoucherEntrySchema' }, minItems: 2 }
+    VoucherEntryResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        account_id: { type: integer }
+        account: { type: object, properties: { id: { type: integer }, code: { type: string }, name: { type: string } } }
+        summary: { type: string }
+        direction: { type: string }
+        amount: { type: number }
+        currency_code: { type: string }
+        original_amount: { type: number, nullable: true }
+        exchange_rate: { type: number }
+        partner_id: { type: integer, nullable: true }
+        vat_rate: { type: number, nullable: true }
+        vat_amount: { type: number, nullable: true }
+    VoucherResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        ledger_id: { type: integer }
+        voucher_number: { type: string }
+        voucher_date: { type: string, format: date }
+        attachments_count: { type: integer }
+        status: { type: string, enum: [DRAFT, APPROVED, POSTED] }
+        source_type: { type: string, nullable: true }
+        contract_number: { type: string, nullable: true }
+        entries: { type: array, items: { $ref: '#/components/schemas/VoucherEntryResponse' } }
+    AIGenerateRequest:
+      type: object
+      required: [raw_text]
+      properties:
+        raw_text: { type: string, description: 发票/流水原始文本或 JSON }
+        provider: { type: string, description: 覆盖默认 LLM provider }
+    VoucherPrintData:
+      type: object
+      properties:
+        voucher: { $ref: '#/components/schemas/VoucherResponse' }
+        ledger_name: { type: string }
+        company_name: { type: string }
+        print_format: { type: string, enum: [A4, A5, wide_24x14] }
+
+    # --- Reports ---
+    BalanceSheetResponse:
+      type: object
+      properties:
+        as_of: { type: string, format: date }
+        assets: { type: array, items: { type: object } }
+        liabilities: { type: array, items: { type: object } }
+        equity: { type: array, items: { type: object } }
+        total_assets: { type: number }
+        total_liabilities_equity: { type: number }
+    IncomeStatementResponse:
+      type: object
+      properties:
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        revenue: { type: array, items: { type: object } }
+        costs: { type: array, items: { type: object } }
+        expenses: { type: array, items: { type: object } }
+        net_profit: { type: number }
+    SubsidiaryLedgerResponse:
+      type: object
+      properties:
+        account_code: { type: string }
+        account_name: { type: string }
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        opening_balance: { type: number }
+        entries: { type: array, items: { type: object } }
+        closing_balance: { type: number }
+    OEMContractReport:
+      type: object
+      properties:
+        contract_number: { type: string }
+        revenue_total: { type: number }
+        cost_total: { type: number }
+        expense_total: { type: number }
+        gross_profit: { type: number }
+        entries: { type: array, items: { type: object } }
+    CommissionReport:
+      type: object
+      properties:
+        period: { type: string }
+        salespersons: { type: array, items: { type: object } }
+        total_commission: { type: number }
+
+    # --- Closing ---
+    ClosingRequest:
+      type: object
+      required: [year, month]
+      properties:
+        year: { type: integer }
+        month: { type: integer }
+    ClosingResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        operation_type: { type: string }
+        year: { type: integer }
+        month: { type: integer }
+        voucher_id: { type: integer, nullable: true }
+        result_message: { type: string }
+        already_performed: { type: boolean, default: false }
+
+    # --- Tax ---
+    TaxRateCreate:
+      type: object
+      required: [tax_type, rate, effective_from]
+      properties:
+        tax_type: { type: string, enum: [vat_input, vat_output, export_rebate] }
+        rate: { type: number, description: e.g. 0.13 for 13% }
+        description: { type: string }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date, nullable: true }
+
+    # --- Error ---
+    ErrorResponse:
+      type: object
+      properties:
+        detail: { type: string }
+
+    # --- Health ---
+    HealthResponse:
+      type: object
+      properties:
+        status: { type: string, example: ok }
+        database: { type: string, example: connected }
+        redis: { type: string, example: connected }
+        version: { type: string }
+
+security:
+  - BearerAuth: []
+
+paths:
+  # ========== AUTH ==========
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/LoginResponse' } } } }
+        '401': { description: Invalid credentials, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '429': { description: Rate limited (5 req/min on login) }
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register new user (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '403': { description: Admin only }
+
+  # ========== USERS ==========
+  /users/me:
+    get:
+      tags: [Auth]
+      summary: Get current user profile
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+
+  # ========== LEDGERS ==========
+  /ledgers:
+    get:
+      tags: [Ledgers]
+      summary: List all ledgers accessible to current user
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Ledger' } } } } }
+    post:
+      tags: [Ledgers]
+      summary: Create a new ledger (账套)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerCreate' }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Ledger' } } } }
+
+  # ========== ACCOUNTS ==========
+  /accounts:
+    get:
+      tags: [Accounts]
+      summary: List chart of accounts (hierarchical)
+      parameters:
+        - name: active_only
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Account' } } } } }
+    post:
+      tags: [Accounts]
+      summary: Create an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountCreate' }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } } }
+
+  /accounts/{id}:
+    put:
+      tags: [Accounts]
+      summary: Update an account
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountCreate' }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } } }
+
+  # ========== PARTNERS ==========
+  /partners:
+    get:
+      tags: [Partners]
+      summary: List business partners
+      parameters:
+        - name: type
+          in: query
+          schema: { type: string, enum: [CUSTOMER, VENDOR, BOTH] }
+        - name: active_only
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Partner' } } } } }
+    post:
+      tags: [Partners]
+      summary: Create a business partner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PartnerCreate' }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Partner' } } } }
+
+  # ========== VOUCHERS ==========
+  /vouchers:
+    get:
+      tags: [Vouchers]
+      summary: List vouchers with pagination & filters
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+        - name: status
+          in: query
+          schema: { type: string, enum: [DRAFT, APPROVED, POSTED] }
+        - name: date_from
+          in: query
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date }
+        - name: keyword
+          in: query
+          schema: { type: string, description: 摘要/凭证号搜索 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/VoucherResponse' } }, total: { type: integer } } } } } }
+    post:
+      tags: [Vouchers]
+      summary: Create a voucher manually
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VoucherCreate' }
+      responses:
+        '200': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/VoucherResponse' } } } }
+
+  /vouchers/ai-generate:
+    post:
+      tags: [Vouchers]
+      summary: AI generates voucher entries from raw invoice/statement text
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AIGenerateRequest' }
+      responses:
+        '200': { description: AI-generated voucher (DRAFT), content: { application/json: { schema: { $ref: '#/components/schemas/VoucherResponse' } } } }
+
+  /vouchers/upload-invoice:
+    post:
+      tags: [Vouchers]
+      summary: Upload invoice PDF/image for OCR + AI voucher generation
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: Parsed invoice data + generated voucher, content: { application/json: { schema: { type: object, properties: { extracted_data: { type: object }, voucher: { $ref: '#/components/schemas/VoucherResponse' } } } } } }
+
+  /vouchers/{id}:
+    get:
+      tags: [Vouchers]
+      summary: Get voucher by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/VoucherResponse' } } } }
+
+  /vouchers/{id}/print:
+    get:
+      tags: [Vouchers]
+      summary: Get print-ready voucher data
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: format
+          in: query
+          schema: { type: string, enum: [A4, A5, wide_24x14], default: A4 }
+      responses:
+        '200': { description: Print data, content: { application/json: { schema: { $ref: '#/components/schemas/VoucherPrintData' } } } }
+
+  /vouchers/{id}/post:
+    post:
+      tags: [Vouchers]
+      summary: Post a voucher (过账) — changes status from DRAFT/APPROVED to POSTED
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Posted, content: { application/json: { schema: { $ref: '#/components/schemas/VoucherResponse' } } } }
+
+  /vouchers/{id}/approve:
+    post:
+      tags: [Vouchers]
+      summary: Approve a voucher
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Approved, content: { application/json: { schema: { $ref: '#/components/schemas/VoucherResponse' } } } }
+
+  # ========== REPORTS ==========
+  /reports/balance-sheet:
+    get:
+      tags: [Reports]
+      summary: Balance sheet (资产负债表)
+      parameters:
+        - name: as_of
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/BalanceSheetResponse' } } } }
+
+  /reports/income-statement:
+    get:
+      tags: [Reports]
+      summary: Income statement (利润表)
+      parameters:
+        - name: period_start
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: period_end
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IncomeStatementResponse' } } } }
+
+  /reports/cash-flow:
+    get:
+      tags: [Reports]
+      summary: Cash flow statement (现金流量表)
+      parameters:
+        - name: period_start
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: period_end
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /reports/subsidiary:
+    get:
+      tags: [Reports]
+      summary: Subsidiary ledger (明细账)
+      parameters:
+        - name: account_code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: period_start
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: period_end
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/SubsidiaryLedgerResponse' } } } }
+
+  /reports/oem-contract/{contract_number}:
+    get:
+      tags: [Reports]
+      summary: OEM contract P&L report (按合同单出报告)
+      parameters:
+        - name: contract_number
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/OEMContractReport' } } } }
+
+  /reports/commission:
+    get:
+      tags: [Reports]
+      summary: Sales commission report (业务员提成)
+      parameters:
+        - name: year
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: month
+          in: query
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CommissionReport' } } } }
+
+  # ========== CLOSING ==========
+  /closing/depreciate:
+    post:
+      tags: [Closing]
+      summary: Auto-depreciate fixed assets for the period (一键计提折旧)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClosingRequest' }
+      responses:
+        '200': { description: Depreciation voucher created, content: { application/json: { schema: { $ref: '#/components/schemas/ClosingResponse' } } } }
+
+  /closing/monthly:
+    post:
+      tags: [Closing]
+      summary: Monthly profit carry-forward (月末结转利润)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClosingRequest' }
+      responses:
+        '200': { description: Profit carried forward, content: { application/json: { schema: { $ref: '#/components/schemas/ClosingResponse' } } } }
+
+  /closing/yearly:
+    post:
+      tags: [Closing]
+      summary: Annual close (年度结转)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClosingRequest' }
+      responses:
+        '200': { description: Annual close completed, content: { application/json: { schema: { $ref: '#/components/schemas/ClosingResponse' } } } }
+
+  /closing/reverse:
+    post:
+      tags: [Closing]
+      summary: Reverse a closing period (反结账)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClosingRequest' }
+      responses:
+        '200': { description: Period reversed, content: { application/json: { schema: { $ref: '#/components/schemas/ClosingResponse' } } } }
+
+  # ========== TAX ==========
+  /tax/rates:
+    get:
+      tags: [Tax]
+      summary: List tax rates
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+    post:
+      tags: [Tax]
+      summary: Create a tax rate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaxRateCreate' }
+      responses:
+        '200': { description: Created }
+
+  /tax/vat-records:
+    get:
+      tags: [Tax]
+      summary: Query VAT records for tax filing (纳税申报)
+      parameters:
+        - name: year
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: month
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: vat_type
+          in: query
+          schema: { type: string, enum: [input, output] }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+
+  # ========== EXPORT ==========
+  /export/vouchers/{id}/excel:
+    get:
+      tags: [Export]
+      summary: Export voucher to Excel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Excel file, content: { application/vnd.openxmlformats-officedocument.spreadsheetml.sheet: { schema: { type: string, format: binary } } } }
+
+  /export/reports/{type}/excel:
+    get:
+      tags: [Export]
+      summary: Export report to Excel
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema: { type: string, enum: [balance-sheet, income-statement, cash-flow, subsidiary, oem-contract, commission] }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date }
+        - name: period_start
+          in: query
+          schema: { type: string, format: date }
+        - name: period_end
+          in: query
+          schema: { type: string, format: date }
+        - name: account_code
+          in: query
+          schema: { type: string }
+        - name: contract_number
+          in: query
+          schema: { type: string }
+        - name: year
+          in: query
+          schema: { type: integer }
+        - name: month
+          in: query
+          schema: { type: integer }
+      responses:
+        '200': { description: Excel file, content: { application/vnd.openxmlformats-officedocument.spreadsheetml.sheet: { schema: { type: string, format: binary } } } }
+
+  # ========== AI ==========
+  /ai/chat:
+    post:
+      tags: [AI]
+      summary: AI chat for natural-language account management
+      description: |
+        Natural language interface for managing chart of accounts. Examples:
+        - "帮我在资产下面加一个'应收账款'科目"
+        - "把1001库存现金改成'现金'"
+        - "列出所有资产类科目"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string }
+      responses:
+        '200': { description: AI response with actions taken, content: { application/json: { schema: { type: object } } } }
+
+  # ========== SYSTEM ==========
+  /system/health:
+    get:
+      tags: [System]
+      summary: Health check
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/HealthResponse' } } } }
+
+  /audit-logs:
+    get:
+      tags: [System]
+      summary: View audit trail
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: username
+          in: query
+          schema: { type: string }
+        - name: date_from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  /backups:
+    get:
+      tags: [System]
+      summary: List backups
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+    post:
+      tags: [System]
+      summary: Trigger manual backup
+      responses:
+        '200': { description: Backup created }

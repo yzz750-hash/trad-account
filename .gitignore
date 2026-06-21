@@ -1,0 +1,30 @@
+# Root
+.vscode/
+.claude/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Documents / uploads
+*.pdf
+test.txt
+
+# Backend
+backend/__pycache__/
+backend/venv/
+backend/.env
+backend/logs/
+backend/uploads/
+backend/.mypy_cache/
+backend/.pytest_cache/
+backend/*.log
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/out/
+frontend/*.tsbuildinfo
+.gstack/

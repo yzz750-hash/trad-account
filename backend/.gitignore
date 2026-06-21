@@ -1,0 +1,13 @@
+# Backend
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.db
+logs/
+uploads/
+.mypy_cache/
+.pytest_cache/
+test_*.db
+*.log
