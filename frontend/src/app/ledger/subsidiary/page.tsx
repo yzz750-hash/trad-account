@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { apiFetch } from "@/lib/api";
 import { useLedger } from "@/context/LedgerContext";
+import { d } from "@/lib/decimal";
 import type { AccountInfo } from "@/lib/types";
 import AccountSelect from "@/components/AccountSelect";
 
@@ -84,10 +85,10 @@ export default function SubsidiaryLedger() {
       e.date,
       e.voucher_number || "",
       e.summary,
-      e.debit_amount !== null && e.debit_amount !== undefined ? Number(e.debit_amount).toFixed(2) : "",
-      e.credit_amount !== null && e.credit_amount !== undefined ? Number(e.credit_amount).toFixed(2) : "",
+      e.debit_amount !== null && e.debit_amount !== undefined ? d(e.debit_amount).toFixed(2) : "",
+      e.credit_amount !== null && e.credit_amount !== undefined ? d(e.credit_amount).toFixed(2) : "",
       e.balance_direction,
-      Number(e.balance).toFixed(2)
+      d(e.balance).toFixed(2)
     ]);
     
     const csvEscape = (val: string) => {
@@ -339,10 +340,10 @@ export default function SubsidiaryLedger() {
                   <td className="py-2 px-4 print:py-1 print:px-2 text-slate-600">{e.date}</td>
                   <td className="py-2 px-4 print:py-1 print:px-2 font-medium text-indigo-600 break-words">{e.voucher_number || "-"}</td>
                   <td className="py-2 px-4 print:py-1 print:px-2 text-slate-700 break-words whitespace-normal">{e.summary}</td>
-                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono text-slate-700">{Number(e.debit_amount) > 0 ? Number(e.debit_amount).toFixed(2) : ""}</td>
-                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono text-slate-700">{Number(e.credit_amount) > 0 ? Number(e.credit_amount).toFixed(2) : ""}</td>
+                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono text-slate-700">{d(e.debit_amount).gt(0) ? d(e.debit_amount).toFixed(2) : ""}</td>
+                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono text-slate-700">{d(e.credit_amount).gt(0) ? d(e.credit_amount).toFixed(2) : ""}</td>
                   <td className="py-2 px-4 print:py-1 print:px-2 text-center text-slate-500">{e.balance_direction}</td>
-                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono font-medium text-slate-900">{Number(e.balance).toFixed(2)}</td>
+                  <td className="py-2 px-4 print:py-1 print:px-2 text-right font-mono font-medium text-slate-900">{d(e.balance).toFixed(2)}</td>
                 </tr>
               ))}
               {entries.length === 0 && (

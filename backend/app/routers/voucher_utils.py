@@ -288,7 +288,28 @@ def _build_3level_debit_account(db: Session, ledger_id: int, root_code: str, cat
     return _ensure_child_account(db, ledger_id, l2, l3_name)
 
 
+def _extract_city(vendor_name: str) -> str:
+    """Extract city name from a Chinese company name.
+
+    Chinese company names typically start with the city (2-4 chars).
+    Examples: 临沂华威 → 临沂, 石家庄xx → 石家庄, 乌鲁木齐xx → 乌鲁木齐
+    """
+    four_char = {"乌鲁木齐", "呼和浩特", "齐齐哈尔"}
+    three_char = {"石家庄", "张家口", "连云港", "秦皇岛", "驻马店", "三门峡", "佳木斯"}
+    if len(vendor_name) >= 4 and vendor_name[:4] in four_char:
+        return vendor_name[:4]
+    if len(vendor_name) >= 3 and vendor_name[:3] in three_char:
+        return vendor_name[:3]
+    if len(vendor_name) >= 2:
+        return vendor_name[:2]
+    return vendor_name
+
+
 def _build_vendor_account(db: Session, ledger_id: int, root_code: str, vendor_name: str) -> Account:
+    """Build a 3-level accounts payable account: 2202 → city → vendor.
+
+    Example: 2202 (应付账款) → 220201 (应付账款-临沂) → 22020101 (应付账款-临沂-临沂华威工具制造有限公司)
+    """
     root = db.query(Account).filter(
         Account.ledger_id == ledger_id, Account.code == root_code
     ).first()
@@ -297,8 +318,11 @@ def _build_vendor_account(db: Session, ledger_id: int, root_code: str, vendor_na
             status_code=400,
             detail=f"根级科目 {root_code} 不存在，请先在科目设置中创建该科目。",
         )
-    l2_name = f"{root.name}-{vendor_name}"
-    return _ensure_child_account(db, ledger_id, root, l2_name)
+    city = _extract_city(vendor_name)
+    l2_name = f"{root.name}-{city}"
+    l2 = _ensure_child_account(db, ledger_id, root, l2_name)
+    l3_name = f"{l2.name}-{vendor_name}"
+    return _ensure_child_account(db, ledger_id, l2, l3_name)
 
 
 def _infer_category(item_name: str) -> str:
@@ -368,7 +392,156 @@ def get_next_voucher_number(db: Session, ledger_id: int, prefix: str = "记-") -
             db.flush()
             return f"{prefix}{counter.current_number}"
         except IntegrityError:
+            # After an IntegrityError the SQLAlchemy Session enters a "broken"
+            # state where any further statements raise until rollback() is
+            # called. Without this rollback, every subsequent retry attempt
+            # would silently re-raise the same error and burn through all
+            # retries in microseconds, then bubble up to the caller.
+            db.rollback()
             if attempt < max_retries - 1:
                 time.sleep(random.uniform(0.05, 0.2))
                 continue
             raise
+
+
+def _match_ai_entries_to_ocr(
+    ai_entries: list[AIDebitEntrySchema],
+    ocr_items: list[dict],
+) -> list[tuple[AIDebitEntrySchema, dict]]:
+    """Match AI-classified entries to OCR items by vendor + fuzzy item name.
+
+    Returns a list of (ai_entry, ocr_item) pairs in the same order as ocr_items.
+    Raises HTTPException if any OCR item cannot be matched.
+    """
+    unmatched_ocr = list(ocr_items)
+    result: list[tuple[AIDebitEntrySchema, dict]] = []
+
+    for ocr_item in ocr_items:
+        ocr_name = str(ocr_item.get("item_name", "")).strip()
+        ocr_vendor = str(ocr_item.get("_vendor", "")).strip()
+
+        best: AIDebitEntrySchema | None = None
+        best_score = 0
+
+        for ai in ai_entries:
+            ai_name = (ai.item_name or "").strip()
+            ai_vendor = (ai.vendor or "").strip()
+
+            if ocr_vendor and ai_vendor and ocr_vendor != ai_vendor:
+                continue
+
+            score = 0
+            if ai_name and ocr_name:
+                if ai_name == ocr_name:
+                    score = 100
+                elif ai_name in ocr_name or ocr_name in ai_name:
+                    score = 80
+
+            if score > best_score:
+                best_score = score
+                best = ai
+
+        if best is None or best_score == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"AI 返回的商品 \"{ocr_name}\" 与 OCR 数据无法匹配，请重试。",
+            )
+        result.append((best, ocr_item))
+
+    return result
+
+
+def _process_ai_debit_entries(
+    db: Session,
+    ledger_id: int,
+    matched: list[tuple[AIDebitEntrySchema, dict]],
+    voucher_id: int,
+) -> tuple[Decimal, list[dict]]:
+    """Create debit-side voucher entries from matched AI-OCR pairs.
+
+    Handles VAT splitting: if ocr_item has tax_amount > 0, splits into
+    goods amount (tax-exclusive) and VAT input (222101).
+
+    Returns (total_debit, debit_entry_dicts) where each dict has
+    account_code, amount, summary for rule validation.
+    """
+    VAT_INPUT_CODE = "222101"
+    total_debit = Decimal("0.00")
+    debit_entries: list[dict] = []
+
+    for ai_entry, ocr_item in matched:
+        root_code = ai_entry.account_code
+        item_name = ai_entry.item_name
+        vendor = ai_entry.vendor or ocr_item.get("_vendor", "")
+        category = ai_entry.category or _infer_category(item_name)
+
+        # Amount from OCR, NOT from AI
+        raw_amount = str(ocr_item.get("amount", "0")).strip() or "0"
+        try:
+            amt = Decimal(raw_amount)
+        except Exception:
+            amt = Decimal("0.00")
+
+        if amt <= 0:
+            continue
+
+        raw_tax = str(ocr_item.get("tax_amount", "0")).strip() or "0"
+        try:
+            tax_amt = Decimal(raw_tax)
+        except Exception:
+            tax_amt = Decimal("0.00")
+
+        if tax_amt > 0 and tax_amt < amt:
+            tax_exclusive = amt - tax_amt
+            summary = _build_item_summary(ocr_item, vendor)
+            acct = _build_3level_debit_account(db, ledger_id, root_code, category, item_name)
+            db.add(VoucherEntry(
+                voucher_id=voucher_id, account_id=acct.id, summary=summary,
+                direction=AccountDirection.DEBIT, amount=tax_exclusive,
+            ))
+            total_debit += tax_exclusive
+            debit_entries.append({"account_code": acct.code, "amount": tax_exclusive, "summary": summary})
+
+            vat_acct = _ensure_account_chain(
+                db, ledger_id, VAT_INPUT_CODE,
+                "应交税费-应交增值税-进项税额",
+                acct.account_type, acct.balance_direction,
+            )
+            db.add(VoucherEntry(
+                voucher_id=voucher_id, account_id=vat_acct.id,
+                summary=f"进项税额 - {summary}",
+                direction=AccountDirection.DEBIT, amount=tax_amt,
+            ))
+            total_debit += tax_amt
+            debit_entries.append({"account_code": VAT_INPUT_CODE, "amount": tax_amt, "summary": f"进项税额 - {summary}"})
+        else:
+            summary = _build_item_summary(ocr_item, vendor)
+            acct = _build_3level_debit_account(db, ledger_id, root_code, category, item_name)
+            db.add(VoucherEntry(
+                voucher_id=voucher_id, account_id=acct.id, summary=summary,
+                direction=AccountDirection.DEBIT, amount=amt,
+            ))
+            total_debit += amt
+            debit_entries.append({"account_code": acct.code, "amount": amt, "summary": summary})
+
+    return total_debit, debit_entries
+
+
+def _build_item_summary(item: dict, vendor: str) -> str:
+    """Build voucher entry summary from OCR item data."""
+    name = item.get("item_name", "")
+    qty = str(item.get("quantity", "")).strip()
+    spec = str(item.get("specification", "")).strip()
+
+    parts = [name]
+    if qty and qty != "0":
+        parts.append(f"×{qty}")
+        if spec and spec != name:
+            parts.append(spec)
+    elif spec and spec != name:
+        parts.append(spec)
+
+    base = " ".join(parts)
+    if vendor:
+        base += f" ({vendor})"
+    return base

@@ -74,8 +74,10 @@ def auto_depreciate_assets(year: int, month: int, db: Session = Depends(get_db),
             detail=f"Depreciation accounts not found: {'6602/6601' if not debit_acc else ''}{' and ' if not debit_acc and not credit_acc else ''}{'1602' if not credit_acc else ''}."
         )
 
+    import calendar as _cal
+    _, _last_day = _cal.monthrange(year, month)
     v = Voucher(ledger_id=ledger_id, voucher_number=get_next_voucher_number(db, ledger_id),
-        voucher_date=date(year, month, 28),
+        voucher_date=date(year, month, _last_day),
         status=VoucherStatus.DRAFT,
     )
     db.add(v)
@@ -124,7 +126,9 @@ def carry_forward_profit_loss(year: int, month: int, db: Session = Depends(get_d
         db.rollback()
         return {"status": "success", "message": "No profit/loss entries to carry forward."}
 
-    voucher_date = date(year, month, 28)
+    import calendar as _cal
+    _, _last_day = _cal.monthrange(year, month)
+    voucher_date = date(year, month, _last_day)
     v = Voucher(ledger_id=ledger_id, voucher_number=get_next_voucher_number(db, ledger_id),
         voucher_date=voucher_date,
         status=VoucherStatus.DRAFT,
@@ -196,6 +200,7 @@ def carry_forward_year_end(year: int, db: Session = Depends(get_db), ledger_id: 
         .filter(
             Voucher.ledger_id == ledger_id,
             VoucherEntry.account_id == profit_account.id,
+            Voucher.status == VoucherStatus.POSTED,
             extract("year", Voucher.voucher_date) == year,
         )
         .group_by(VoucherEntry.direction)
@@ -282,6 +287,8 @@ def fx_revaluation(year: int, month: int, db: Session = Depends(get_db), ledger_
     if not fx_account:
         raise HTTPException(status_code=400, detail="未找到 6603 财务费用 科目")
 
+    from app.services.closing import FX_REVALUATION_SOURCE_TYPE
+
     entries, total_gain_loss = calculate_fx_revaluation(db, ledger_id, year, month)
 
     if not entries:
@@ -292,10 +299,14 @@ def fx_revaluation(year: int, month: int, db: Session = Depends(get_db), ledger_
     v_num = get_next_voucher_number(db, ledger_id, prefix="期末调汇-")
     import calendar
     _, last_day = calendar.monthrange(year, month)
+    # Use DRAFT status so the FX revaluation voucher goes through the normal
+    # review/post workflow instead of bypassing segregation of duties. The
+    # source_type tag lets subsequent runs exclude it from the FX baseline.
     v = Voucher(ledger_id=ledger_id, voucher_number=v_num,
         voucher_date=date(year, month, last_day),
         attachments_count=0,
-        status=VoucherStatus.POSTED,
+        status=VoucherStatus.DRAFT,
+        source_type=FX_REVALUATION_SOURCE_TYPE,
     )
     db.add(v)
     db.flush()
@@ -371,7 +382,15 @@ def close_period(year: int, month: int, db: Session = Depends(get_db), ledger_id
 @router.post("/unclose")
 def unclose_period(year: int, month: int, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), current_user = Depends(require_write)):
     """
-    反结账：解锁期间
+    反结账：解锁期间。
+
+    会级联清理：
+    1. 当月及后续所有期间的期末凭证（折旧/损益结转/FX 调汇/年末结转）；
+       通过 voucher_id 反查 ClosingOperation，定位系统生成的期末凭证。
+    2. 对应的 ClosingOperation 幂等记录（否则下次无法重做期末操作）。
+    3. 当月及后续所有期间的 AccountBalance（余额链已断，必须重算）。
+    4. 重开当月及后续已 CLOSED 的 AccountingPeriod。
+    用户在期间内手工录入的凭证不受影响。
     """
     logger.info("Period unclosing started for ledger %s, period %s-%s", ledger_id, year, month)
     period = db.query(AccountingPeriod).filter(
@@ -385,39 +404,84 @@ def unclose_period(year: int, month: int, db: Session = Depends(get_db), ledger_
     if period.status == PeriodStatus.OPEN:
         raise HTTPException(status_code=400, detail="Period is already open.")
 
-    period.status = PeriodStatus.OPEN
-    # Delete this period's balances AND all subsequent periods (chain is broken)
-    # Find all subsequent periods that have AccountBalance rows
-    subsequent = db.query(AccountBalance).filter(
-        AccountBalance.ledger_id == ledger_id,
-        ((AccountBalance.year == year) & (AccountBalance.month > month))
-        | (AccountBalance.year > year),
-    ).all()
-    if subsequent:
-        logger.warning(
-            "Unclosing %s-%s: cascade-deleting %d subsequent AccountBalance rows. "
-            "These periods must be re-closed in chronological order.",
-            year, month, len(subsequent),
-        )
-        for sb in subsequent:
-            db.delete(sb)
-        # Also reopen subsequent CLOSED periods since their balances are now invalid
-        subs_periods = db.query(AccountingPeriod).filter(
-            AccountingPeriod.ledger_id == ledger_id,
-            AccountingPeriod.status == PeriodStatus.CLOSED,
-            (
-                ((AccountingPeriod.year == year) & (AccountingPeriod.month > month))
-                | (AccountingPeriod.year > year)
-            ),
-        ).all()
-        for sp in subs_periods:
-            sp.status = PeriodStatus.OPEN
-            logger.warning("Unclose cascade: reopened period %s-%s", sp.year, sp.month)
+    # Identify the boundary: (year, month) and everything after.
+    # Use a SQL OR so we cover both same-year-future-months and later years.
+    from sqlalchemy import or_ as _or
 
-    db.query(AccountBalance).filter(
+    def _period_filter(col_year, col_month):
+        return _or(
+            (col_year == year) & (col_month >= month),
+            col_year > year,
+        )
+
+    # 1. Collect voucher_ids of all ClosingOperations for this period and later.
+    closing_ops = (
+        db.query(ClosingOperation)
+        .filter(
+            ClosingOperation.ledger_id == ledger_id,
+            _period_filter(ClosingOperation.year, ClosingOperation.month),
+        )
+        .all()
+    )
+    closing_voucher_ids = [op.voucher_id for op in closing_ops if op.voucher_id is not None]
+
+    # 2. Delete the system-generated closing vouchers (entries cascade via FK or
+    #    ORM relationship). User-authored vouchers in the period are preserved.
+    deleted_voucher_count = 0
+    if closing_voucher_ids:
+        # Delete VoucherEntry rows first to avoid FK violations on Voucher delete.
+        db.query(VoucherEntry).filter(
+            VoucherEntry.voucher_id.in_(closing_voucher_ids)
+        ).delete(synchronize_session="fetch")
+        db.query(Voucher).filter(
+            Voucher.id.in_(closing_voucher_ids),
+            Voucher.ledger_id == ledger_id,
+        ).delete(synchronize_session="fetch")
+        deleted_voucher_count = len(closing_voucher_ids)
+
+    # 3. Drop the idempotency claims so the operations can be re-run.
+    for op in closing_ops:
+        db.delete(op)
+
+    # 4. Invalidate AccountBalance rows for this period and all subsequent ones.
+    #    The balance chain is broken once a period is reopened.
+    subsequent_balances = db.query(AccountBalance).filter(
         AccountBalance.ledger_id == ledger_id,
-        AccountBalance.year == year,
-        AccountBalance.month == month,
-    ).delete()
+        _period_filter(AccountBalance.year, AccountBalance.month),
+    ).all()
+    if subsequent_balances:
+        logger.warning(
+            "Unclosing %s-%s: cascade-deleting %d AccountBalance rows (this period + subsequent). "
+            "These periods must be re-closed in chronological order.",
+            year, month, len(subsequent_balances),
+        )
+        for sb in subsequent_balances:
+            db.delete(sb)
+
+    # 5. Reopen subsequent CLOSED periods (their balances are now invalid).
+    subs_periods = db.query(AccountingPeriod).filter(
+        AccountingPeriod.ledger_id == ledger_id,
+        AccountingPeriod.status == PeriodStatus.CLOSED,
+        _period_filter(AccountingPeriod.year, AccountingPeriod.month),
+    ).all()
+    for sp in subs_periods:
+        sp.status = PeriodStatus.OPEN
+        logger.warning("Unclose cascade: reopened period %s-%s", sp.year, sp.month)
+
+    # 6. Finally reopen the requested period itself.
+    period.status = PeriodStatus.OPEN
+
+    logger.info(
+        "Unclose %s-%s complete: deleted %d closing voucher(s), %d closing op(s), "
+        "%d balance row(s), reopened %d subsequent period(s).",
+        year, month, deleted_voucher_count, len(closing_ops),
+        len(subsequent_balances), len(subs_periods),
+    )
     db.commit()
-    return {"status": "success", "message": f"Period {year}-{month} reopened."}
+    return {
+        "status": "success",
+        "message": (
+            f"Period {year}-{month:02d} reopened. "
+            f"Deleted {deleted_voucher_count} system voucher(s) and {len(closing_ops)} idempotency record(s)."
+        ),
+    }

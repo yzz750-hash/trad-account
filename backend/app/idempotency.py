@@ -23,24 +23,32 @@ def acquire_idempotency(
     Returns (True, new_op) if this request should proceed with the work.
     Returns (False, existing_op) if another request already claimed it.
 
-    The claim is committed inside a SAVEPOINT so it becomes visible to concurrent
-    transactions immediately, closing the TOCTOU window. The caller's subsequent
-    work runs in the outer transaction and can still be rolled back independently.
+    The claim is committed as its own transaction so it becomes visible to
+    concurrent transactions immediately, closing the TOCTOU window. The
+    caller's subsequent work runs in a fresh transaction (SQLAlchemy re-begins
+    automatically on next query) and can still be rolled back independently.
+
+    NOTE: callers must NOT have uncommitted in-flight work in `db` when calling
+    this — any such work will be committed alongside the claim. All current
+    callers (closing router endpoints) invoke this as their first DB-mutating
+    step, after only read-only queries, so the constraint is satisfied.
     """
+    op = ClosingOperation(
+        ledger_id=ledger_id,
+        operation_type=operation_type,
+        year=year,
+        month=month,
+    )
+    db.add(op)
     try:
-        db.begin_nested()  # SAVEPOINT — isolates the claim from the caller's work
-        op = ClosingOperation(
-            ledger_id=ledger_id,
-            operation_type=operation_type,
-            year=year,
-            month=month,
-        )
-        db.add(op)
-        db.flush()
-        db.commit()  # Release savepoint — claim is now visible to other transactions
-        return True, op
+        db.commit()  # Commit the claim so it's visible to other transactions
     except IntegrityError:
-        db.rollback()  # Roll back the savepoint
+        # Unique constraint (ledger_id, operation_type, year, month) violated:
+        # another request already claimed this operation. Roll back the failed
+        # INSERT to restore the session to a usable state, then read the
+        # existing claim. We do NOT use begin_nested() here because the claim
+        # must be cross-transaction visible — a SAVEPOINT would not suffice.
+        db.rollback()
         existing = db.query(ClosingOperation).filter(
             ClosingOperation.ledger_id == ledger_id,
             ClosingOperation.operation_type == operation_type,
@@ -62,3 +70,4 @@ def acquire_idempotency(
             )
             return True, existing
         return False, existing
+    return True, op

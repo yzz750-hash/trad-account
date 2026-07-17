@@ -62,7 +62,7 @@ export default function LedgersPage() {
       const isEditing = editingLedgerId !== null;
       const url = isEditing
         ? `/api/v1/ledgers/${editingLedgerId}`
-        : "/api/v1/ledgers/";
+        : "/api/v1/ledgers";
 
       const data = await apiFetch(url, {
         method: isEditing ? "PUT" : "POST",

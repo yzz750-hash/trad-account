@@ -1,4 +1,4 @@
-﻿"""User management endpoints (admin only)."""
+"""User management endpoints (admin only)."""
 from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -38,7 +38,7 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
-@router.get("/", response_model=list[UserResponse])
+@router.get("", response_model=list[UserResponse])
 def list_users(
     search: Optional[str] = Query(None, description="Search by username"),
     db: Session = Depends(get_db),
@@ -51,7 +51,7 @@ def list_users(
     return [UserResponse.model_validate(u) for u in users]
 
 
-@router.post("/", response_model=UserResponse)
+@router.post("", response_model=UserResponse)
 def create_user(
     user_in: UserCreate,
     db: Session = Depends(get_db),
@@ -107,6 +107,9 @@ def deactivate_user(
         raise HTTPException(status_code=404, detail="User not found")
     if user.username == "admin":
         raise HTTPException(status_code=400, detail="Cannot deactivate the default admin user")
+    # 防止管理员自停用导致系统失去管理权限
+    if user.id == _admin.id:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
     user.is_active = False
     db.commit()
     return {"status": "success", "message": f"User {user.username} deactivated"}

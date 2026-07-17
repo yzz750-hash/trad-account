@@ -117,6 +117,14 @@ export interface Partner {
 }
 
 // -- AI Chat --
+export interface SuggestedVoucherEntry {
+  account_code: string;
+  summary: string;
+  direction: string; // '借' or '贷'
+  amount: string;
+  currency_code?: string;
+}
+
 export interface ChatActionPayload {
   // SUGGEST_ACCOUNT
   proposed_code?: string;
@@ -133,4 +141,7 @@ export interface ChatActionPayload {
   matches?: ReconcileMatch[];
   // RECONCILE_EXECUTION
   voucher_id?: number;
+  // SUGGEST_VOUCHER
+  voucher_date?: string;
+  entries?: SuggestedVoucherEntry[];
 }

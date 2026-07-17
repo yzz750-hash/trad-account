@@ -1,14 +1,10 @@
 """Tests for OCR pipeline: PDF extraction via OpenDataLoader-PDF + LLM parsing."""
-import os
-import sys
 import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.ocr import (
     extract_structured_data_from_pdf,

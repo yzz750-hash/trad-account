@@ -89,7 +89,7 @@ export default function VoucherList() {
   const fetchPartnersAndCurrencies = async () => {
     try {
       const [pRes, cRes] = await Promise.all([
-        apiFetch<Partner[]>("/api/v1/partners/"),
+        apiFetch<Partner[]>("/api/v1/partners"),
         apiFetch<Currency[]>("/api/v1/system/currencies"),
       ]);
       setPartners(pRes);
@@ -273,6 +273,19 @@ export default function VoucherList() {
     }, 100);
   };
 
+  const deleteVoucher = async (id: number) => {
+    if (!confirm("确定要删除该凭证吗？此操作不可撤销。")) return;
+    setLoading(true);
+    try {
+      await apiFetch(`/api/v1/vouchers/${id}`, { method: "DELETE" });
+      setTriggerFetch(t => t + 1);
+    } catch (err) {
+      setError("删除凭证失败: " + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const reverseVoucher = async (id: number) => {
     setLoading(true);
     try {
@@ -299,10 +312,10 @@ export default function VoucherList() {
       e.exchange_rate = String(rates[value] || 1.0);
     }
     if ((field === "original_amount" || field === "exchange_rate" || field === "currency_code") && e.currency_code !== "CNY") {
-      const orig = Number(e.original_amount) || 0;
-      const rate = Number(e.exchange_rate) || 1;
-      if (orig > 0) {
-        e.amount = mul(orig, rate);
+      const orig = d(e.original_amount || "0");
+      const rate = d(e.exchange_rate || "1");
+      if (orig.gt(0)) {
+        e.amount = orig.times(rate).toFixed(2);
       }
     }
     setCreateEntries(newEntries);
@@ -335,7 +348,7 @@ export default function VoucherList() {
         })),
       };
 
-      await apiFetch("/api/v1/vouchers/", {
+      await apiFetch("/api/v1/vouchers", {
         method: "POST",
         body: JSON.stringify(payload),
       });
@@ -481,6 +494,7 @@ export default function VoucherList() {
                       onUpdateEntry={updateEntry}
                       onToggleInvoice={() => handleToggleInvoice(v.id)}
                       onReverse={reverseVoucher}
+                      onDelete={deleteVoucher}
                     />
                   )}
                 </React.Fragment>

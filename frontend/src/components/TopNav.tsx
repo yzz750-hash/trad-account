@@ -1,30 +1,28 @@
 "use client";
 
-import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useLedger } from "@/context/LedgerContext";
-import { getUser, clearAuth, isAuthenticated } from "@/lib/auth";
+import { getUser, clearAuth } from "@/lib/auth";
 
 export default function TopNav() {
   const pathname = usePathname() || "";
   const router = useRouter();
   const { ledgers, currentLedgerId, setCurrentLedgerId, resetLedger } = useLedger();
   const user = getUser();
-  const [authenticated, setAuthenticated] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    isAuthenticated().then((ok) => {
-      if (!cancelled) setAuthenticated(ok);
-    });
-    return () => { cancelled = true; };
-  }, []);
+  // Synchronous auth check: getUser() reads localStorage on every render.
+  // The async isAuthenticated() check in AuthGuard already validates the
+  // token and redirects on expiry — TopNav only needs to know whether to
+  // render the menu. Using a synchronous local check avoids the stale-state
+  // bug where authenticated stayed false after client-side navigation from
+  // /login to /: the layout does not remount on client-side route changes,
+  // so an empty-dependency useEffect never re-ran. usePathname() already
+  // triggers a re-render on navigation, so getUser() re-evaluates then.
+  const authenticated = !!user;
 
   async function handleLogout() {
     resetLedger();
     await clearAuth();
-    setAuthenticated(false);
     router.replace('/login');
   }
 

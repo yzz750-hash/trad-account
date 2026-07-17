@@ -40,15 +40,15 @@ export function getUser(): AuthUser | null {
 }
 
 export async function isAuthenticated(): Promise<boolean> {
-  try {
-    const res = await baseFetch('/api/v1/auth/me');
-    if (res.ok) {
-      const user = await res.json();
-      setAuth(user);
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
+  // 8s timeout: a dead backend should fail fast instead of making the user
+  // stare at a spinner for the browser's default ~30s timeout.
+  // Throws on network/timeout errors so the caller can distinguish "not logged
+  // in" (returns false) from "server unreachable" (throws).
+  const res = await baseFetch('/api/v1/auth/me', {}, 8000);
+  if (res.ok) {
+    const user = await res.json();
+    setAuth(user);
+    return true;
   }
+  return false;
 }

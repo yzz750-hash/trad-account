@@ -243,3 +243,85 @@ class TestAiChatWithMockedLLM:
         payload = meta.get("action_payload") or {}
         # First child was 660201, so next should be 660202
         assert payload.get("proposed_code") == "660202"
+
+    def test_chat_create_voucher_success(self, client, auth_headers, ledger):
+        """CREATE_VOUCHER intent returns VOUCHER_SUGGESTION meta with balanced entries."""
+        voucher_json = json.dumps({
+            "voucher_date": "2024-01-15",
+            "summary": "收到XX公司货款",
+            "entries": [
+                {"account_code": "1002", "summary": "收XX公司货款", "direction": "借", "amount": "72000.00", "currency_code": "CNY"},
+                {"account_code": "1122", "summary": "收XX公司货款", "direction": "贷", "amount": "72000.00", "currency_code": "CNY"},
+            ],
+        })
+        # Mock intent classifier (ai_chat namespace) + voucher generation (app.llm namespace,
+        # which voucher_nl._llm_json imports locally at call time).
+        with self._mock_llm(json.dumps({"intent": "CREATE_VOUCHER"})), \
+                patch("app.llm.get_llm_response", return_value=voucher_json):
+            resp = client.post(
+                "/api/v1/ai/chat",
+                json={"message": "收到XX公司货款72000元，存入银行"},
+                headers={**auth_headers, "X-Ledger-Id": str(ledger.id)},
+            )
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        meta = next(e for e in events if e.get("type") == "meta")
+        assert meta["action_type"] == "VOUCHER_SUGGESTION"
+        payload = meta.get("action_payload") or {}
+        assert payload.get("voucher_date") == "2024-01-15"
+        assert payload.get("summary") == "收到XX公司货款"
+        entries = payload.get("entries") or []
+        assert len(entries) == 2
+        assert {e["account_code"] for e in entries} == {"1002", "1122"}
+        # Balance must hold and totals reported
+        assert payload.get("debit_total") == "72000.00"
+        assert payload.get("credit_total") == "72000.00"
+        # account_id resolved to real Account ids, voucher_number left blank (preview only)
+        assert all(e.get("account_id") for e in entries)
+        assert payload.get("voucher_number") == ""
+
+    def test_chat_create_voucher_unbalanced(self, client, auth_headers, ledger):
+        """CREATE_VOUCHER with unbalanced entries returns an error SSE event."""
+        voucher_json = json.dumps({
+            "voucher_date": "2024-01-15",
+            "summary": "测试不平衡",
+            "entries": [
+                {"account_code": "1002", "summary": "借", "direction": "借", "amount": "100.00", "currency_code": "CNY"},
+                {"account_code": "1122", "summary": "贷", "direction": "贷", "amount": "99.00", "currency_code": "CNY"},
+            ],
+        })
+        with self._mock_llm(json.dumps({"intent": "CREATE_VOUCHER"})), \
+                patch("app.llm.get_llm_response", return_value=voucher_json):
+            resp = client.post(
+                "/api/v1/ai/chat",
+                json={"message": "测试不平衡凭证"},
+                headers={**auth_headers, "X-Ledger-Id": str(ledger.id)},
+            )
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        error_event = next((e for e in events if e.get("type") == "error"), None)
+        assert error_event is not None
+        assert "借贷不平衡" in error_event["text"]
+
+    def test_chat_create_voucher_unknown_account(self, client, auth_headers, ledger):
+        """CREATE_VOUCHER with an account code not in the ledger returns an error."""
+        voucher_json = json.dumps({
+            "voucher_date": "2024-01-15",
+            "summary": "未知科目",
+            "entries": [
+                {"account_code": "9999", "summary": "借", "direction": "借", "amount": "100.00", "currency_code": "CNY"},
+                {"account_code": "1002", "summary": "贷", "direction": "贷", "amount": "100.00", "currency_code": "CNY"},
+            ],
+        })
+        with self._mock_llm(json.dumps({"intent": "CREATE_VOUCHER"})), \
+                patch("app.llm.get_llm_response", return_value=voucher_json):
+            resp = client.post(
+                "/api/v1/ai/chat",
+                json={"message": "测试未知科目"},
+                headers={**auth_headers, "X-Ledger-Id": str(ledger.id)},
+            )
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        error_event = next((e for e in events if e.get("type") == "error"), None)
+        assert error_event is not None
+        assert "9999" in error_event["text"]

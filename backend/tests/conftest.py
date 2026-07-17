@@ -1,11 +1,7 @@
 import os
-import sys
 import pytest
 from datetime import date
 from decimal import Decimal
-
-# Ensure the backend package is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set required env vars before any app imports (JWT_SECRET_KEY is now mandatory)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-for-testing-only")
@@ -33,6 +29,15 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.main import app
+
+# main.py's load_dotenv(override=True) clobbers test env vars with .env values.
+# Re-assert test values so seed passwords match what tests hardcode.
+os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
+os.environ["ADMIN_PASSWORD"] = "admin123"
+os.environ["ACCOUNTANT_PASSWORD"] = "accountant1"
+os.environ["AUDITOR_PASSWORD"] = "auditor123"
+os.environ["ENVIRONMENT"] = "development"
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 from app.rate_limit import get_limiter
 from app.models.financial import (
     Ledger,
@@ -83,16 +88,28 @@ def _seed_users(session):
 @pytest.fixture(autouse=True)
 def clean_db():
     """Recreate all tables and reset rate limiter before each test."""
-    # Restore DATABASE_URL in case a previous test overwrote it (e.g. alembic tests)
+    import gc as _gc
+    import time as _time
+
     os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
     get_limiter().reset()
-    import gc as _gc
-    _gc.collect()  # Collect lingering references to DB connections
-    # Dispose engine pool to release any lingering connections / WAL locks
+    _gc.collect()
     engine.dispose()
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    # Seed default users required for auth tests
+    _time.sleep(0.15)  # ponytail: Windows needs time to release SQLite WAL file handles
+
+    # Retry on Windows where SQLite WAL locks can linger
+    for attempt in range(5):
+        try:
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
+            break
+        except Exception:
+            if attempt == 4:
+                raise
+            _time.sleep(0.3 * (attempt + 1))
+            _gc.collect()
+            engine.dispose()
+
     session = TestingSessionLocal()
     try:
         _seed_users(session)
@@ -101,7 +118,11 @@ def clean_db():
     yield
     _gc.collect()
     engine.dispose()
-    Base.metadata.drop_all(bind=engine)
+    _time.sleep(0.05)
+    try:
+        Base.metadata.drop_all(bind=engine)
+    except Exception:
+        pass  # ponytail: cleanup is best-effort, next setup recreates fresh
 
 
 @pytest.fixture

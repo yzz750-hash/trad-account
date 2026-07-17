@@ -19,7 +19,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -77,7 +77,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.13'
 
       - name: Install backend dependencies
         run: |
@@ -99,6 +99,16 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install chromium
 
+      - name: Run Alembic migrations
+        run: python -m alembic upgrade head
+        working-directory: backend
+        env:
+          JWT_SECRET_KEY: test-ci-jwt-secret-key-for-ci-only
+          DATABASE_URL: sqlite:///./ci_test.db
+          ADMIN_PASSWORD: admin123
+          ACCOUNTANT_PASSWORD: accountant1
+          AUDITOR_PASSWORD: auditor123
+
       - name: Start backend server
         run: >
           uvicorn app.main:app --host 127.0.0.1 --port 8000 &
@@ -112,8 +122,12 @@ jobs:
         env:
           JWT_SECRET_KEY: test-ci-jwt-secret-key-for-ci-only
           ENVIRONMENT: ci
+          DATABASE_URL: sqlite:///./ci_test.db
           REDIS_URL: redis://localhost:6379/0
           ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001
+          ADMIN_PASSWORD: admin123
+          ACCOUNTANT_PASSWORD: accountant1
+          AUDITOR_PASSWORD: auditor123
 
       - name: Run Playwright e2e tests
         run: npx playwright test --reporter=github

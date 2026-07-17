@@ -22,7 +22,7 @@ export default function PartnersSettingsPage() {
   const fetchPartners = async () => {
     setLoading(true);
     try {
-      const data = await apiFetch("/api/v1/partners/");
+      const data = await apiFetch("/api/v1/partners");
       setPartners(data);
     } catch (err) {
       console.error(err);
@@ -38,7 +38,7 @@ export default function PartnersSettingsPage() {
   const handleAddPartner = async () => {
     if (!newCode || !newName) return;
     try {
-      await apiFetch("/api/v1/partners/", {
+      await apiFetch("/api/v1/partners", {
         method: "POST",
         body: JSON.stringify({ code: newCode, name: newName, partner_type: newType }),
       });

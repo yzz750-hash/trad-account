@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { apiFetch } from "@/lib/api";
+import { d } from "@/lib/decimal";
 
 interface Currency {
   id: number;
@@ -43,12 +44,12 @@ export default function CurrenciesSettingsPage() {
   }, [year, month]);
 
   const handleUpdateRate = async (currencyCode: string, newRate: string) => {
-    const rateVal = parseFloat(newRate);
-    if (isNaN(rateVal) || rateVal <= 0) return;
+    const rateVal = d(newRate);
+    if (rateVal.isNaN() || rateVal.lte(0)) return;
     try {
       await apiFetch(`/api/v1/system/rates?year=${year}&month=${month}`, {
         method: "POST",
-        body: JSON.stringify({ currency_code: currencyCode, rate: rateVal }),
+        body: JSON.stringify({ currency_code: currencyCode, rate: rateVal.toString() }),
       });
       fetchData();
     } catch (err) {

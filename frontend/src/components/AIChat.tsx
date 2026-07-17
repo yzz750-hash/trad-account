@@ -2,9 +2,13 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useLedger } from "@/context/LedgerContext";
-import type { ChatActionPayload, ProcessedInvoice, ProcessedStatement, ReconcileMatch, InvoiceItem, BankTransaction } from "@/lib/types";
+import { d } from "@/lib/decimal";
+import type { ChatActionPayload, ProcessedInvoice, ProcessedStatement, ReconcileMatch, InvoiceItem, BankTransaction, SuggestedVoucherEntry } from "@/lib/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Empty string = relative paths. In dev, Next.js rewrites proxy /api/* to the
+// FastAPI backend (see next.config.ts), so the browser issues same-origin
+// requests and avoids CSP/CORS issues.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 interface Message {
   id: string;
@@ -57,6 +61,11 @@ export default function AIChat() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // -- Initialize conversation_id from localStorage --
+  // Only the conversation_id (an opaque UUID) is persisted; chat messages
+  // themselves are NOT, because they routinely contain financial data
+  // (amounts, account codes, vendor names, voucher summaries) that would
+  // linger in localStorage indefinitely and be readable by any script
+  // running on the page (XSS) or anyone with disk access.
   useEffect(() => {
     const stored = localStorage.getItem(CONV_ID_KEY);
     const convId = stored || generateId();
@@ -64,28 +73,11 @@ export default function AIChat() {
     setConversationId(convId);
   }, []);
 
-  // -- Load messages from localStorage on mount --
-  useEffect(() => {
-    if (!conversationId) return;
-    const key = `ai_chat_${conversationId}`;
-    const stored = localStorage.getItem(key);
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setMessages(parsed.map((m: Message) => ({ ...m, isStreaming: false, error: undefined })));
-        }
-      } catch { /* ignore corrupt data */ }
-    }
-  }, [conversationId]);
-
-  // -- Persist messages to localStorage --
-  useEffect(() => {
-    if (!conversationId || messages.length === 0) return;
-    const key = `ai_chat_${conversationId}`;
-    const toSave = messages.map(({ isStreaming, error, ...rest }) => rest);
-    localStorage.setItem(key, JSON.stringify(toSave));
-  }, [messages, conversationId]);
+  // NOTE: previous versions loaded and saved chat messages to localStorage
+  // under `ai_chat_${conversationId}`. That code was removed because it
+  // persisted financial data client-side. If conversation history is needed,
+  // it should be fetched from a server-side endpoint with proper auth and
+  // audit logging, not stored in the browser.
 
   // -- Auto-scroll --
   useEffect(() => {
@@ -371,6 +363,48 @@ export default function AIChat() {
     }
   };
 
+  const handleCreateSuggestedVoucher = async (payload: ChatActionPayload) => {
+    if (!payload.voucher_date || !payload.entries || payload.entries.length === 0) return;
+    setLoading(true);
+    try {
+      const body = {
+        voucher_date: payload.voucher_date,
+        voucher_number: "AUTO",
+        attachments_count: 0,
+        entries: payload.entries.map((e) => ({
+          account_code: e.account_code,
+          summary: e.summary,
+          direction: e.direction,
+          amount: e.amount,
+          currency_code: e.currency_code || "CNY",
+        })),
+      };
+      const res = await fetch(`${API_BASE}/api/v1/vouchers`, {
+        method: "POST",
+        headers: buildHeaders(currentLedgerId),
+        credentials: "include",
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "未知错误" }));
+        throw new Error(err.detail || "创建凭证失败");
+      }
+      const data = await res.json();
+      setMessages((prev) => [
+        ...prev,
+        { id: generateId(), text: `✅ 凭证已创建成功！凭证号：${data.voucher_number}`, sender: "ai" },
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "未知错误";
+      setMessages((prev) => [
+        ...prev,
+        { id: generateId(), text: `创建凭证失败：${msg}`, sender: "ai" },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleGenerateVoucher = async (docId: number, isStatement = false) => {
     setLoading(true);
     try {
@@ -474,13 +508,18 @@ export default function AIChat() {
         </div>
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
           <button
+            type="button"
             onClick={newConversation}
-            className="text-white/50 hover:text-white/80 transition-colors text-[10px] mr-1"
+            className="text-white/50 hover:text-white hover:bg-white/10 transition-colors text-xs px-2 py-1 rounded mr-1"
             title="新建会话"
           >
             +新建会话
           </button>
-          <button className="text-white/60 hover:text-white transition-colors">
+          <button
+            onClick={() => setIsMinimized(!isMinimized)}
+            className="text-white/60 hover:text-white transition-colors"
+            title={isMinimized ? "展开" : "收起"}
+          >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               {isMinimized ? (
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
@@ -545,6 +584,60 @@ export default function AIChat() {
                       <div className="mt-3 flex gap-2">
                         <button onClick={() => handleCreateSuggestedAccount(msg.actionPayload!)} className="flex-1 bg-accent text-white text-xs py-2 rounded-lg hover:bg-accent-light transition-colors">一键创建科目</button>
                         <button onClick={() => setInput("请帮我修改科目编码并创建")} className="flex-1 bg-white text-slate-600 text-xs py-2 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors">修改后创建</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* SUGGEST_VOUCHER card */}
+                  {msg.actionType === "SUGGEST_VOUCHER" && msg.actionPayload && (
+                    <div className="mt-3 p-3 bg-emerald-50 rounded-xl border border-emerald-100">
+                      <div className="text-xs text-emerald-600 mb-2 font-medium flex justify-between items-center">
+                        <span>AI 生成的凭证建议</span>
+                        <span className="bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded text-[10px]">待确认</span>
+                      </div>
+                      {/* 日期 */}
+                      <div className="text-xs text-slate-500 mb-2">日期：{msg.actionPayload.voucher_date}</div>
+                      {/* 分录表格 */}
+                      <div className="bg-white rounded-lg overflow-hidden border border-slate-100">
+                        <table className="w-full text-xs">
+                          <thead className="bg-slate-50 text-slate-500">
+                            <tr>
+                              <th className="text-left px-2 py-1">科目</th>
+                              <th className="text-left px-2 py-1">摘要</th>
+                              <th className="text-right px-2 py-1">借方</th>
+                              <th className="text-right px-2 py-1">贷方</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {msg.actionPayload.entries?.map((entry: SuggestedVoucherEntry, idx: number) => (
+                              <tr key={idx} className="border-t border-slate-50">
+                                <td className="px-2 py-1 font-mono">{entry.account_code}</td>
+                                <td className="px-2 py-1">{entry.summary}</td>
+                                <td className="px-2 py-1 text-right font-mono text-emerald-600">
+                                  {entry.direction === "借" ? entry.amount : ""}
+                                </td>
+                                <td className="px-2 py-1 text-right font-mono text-red-500">
+                                  {entry.direction === "贷" ? entry.amount : ""}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      {/* 确认按钮 */}
+                      <div className="mt-3 flex gap-2">
+                        <button
+                          onClick={() => handleCreateSuggestedVoucher(msg.actionPayload!)}
+                          className="flex-1 bg-accent text-white text-xs py-2 rounded-lg hover:bg-accent-light transition-colors"
+                        >
+                          确认创建凭证
+                        </button>
+                        <button
+                          onClick={() => setInput("请帮我修改凭证")}
+                          className="flex-1 bg-white text-slate-600 text-xs py-2 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors"
+                        >
+                          修改
+                        </button>
                       </div>
                     </div>
                   )}
@@ -614,7 +707,7 @@ export default function AIChat() {
                             <div className="font-semibold text-slate-800">{txn.counterpart_name || "未知交易方"}</div>
                             <div className="flex justify-between text-slate-500 mt-1">
                               <span>{txn.transaction_date} | {txn.remarks}</span>
-                              <span className={`font-mono font-semibold ${parseFloat(txn.amount) > 0 ? "text-emerald-600" : "text-red-500"}`}>{parseFloat(txn.amount) > 0 ? "+" : ""}{txn.amount}</span>
+                              <span className={`font-mono font-semibold ${d(txn.amount).gt(0) ? "text-emerald-600" : "text-red-500"}`}>{d(txn.amount).gt(0) ? "+" : ""}{txn.amount}</span>
                             </div>
                           </div>
                         ))}

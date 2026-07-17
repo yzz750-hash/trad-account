@@ -17,7 +17,14 @@ interface Account {
 export default function AccountsSettingsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
+  const [searchInput, setSearchInput] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
+
+  // Debounce search input (300ms) to avoid O(n) filter on every keystroke
+  useEffect(() => {
+    const t = setTimeout(() => setSearchKeyword(searchInput.trim()), 300);
+    return () => clearTimeout(t);
+  }, [searchInput]);
   const [trialBalanceResult, setTrialBalanceResult] = useState<{
     total_debit: number;
     total_credit: number;
@@ -37,12 +44,13 @@ export default function AccountsSettingsPage() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [editAccount, setEditAccount] = useState<Account | null>(null);
   const [editName, setEditName] = useState("");
+  const [editCode, setEditCode] = useState("");
   const [editError, setEditError] = useState("");
 
   const fetchAccounts = async () => {
     setLoading(true);
     try {
-      const data = await apiFetch("/api/v1/accounts/");
+      const data = await apiFetch("/api/v1/accounts");
       setAccounts(data);
     } catch (err) {
       console.error(err);
@@ -55,11 +63,9 @@ export default function AccountsSettingsPage() {
     fetchAccounts();
   }, []);
 
-  const enhancedAccounts = useMemo(() => {
-    const filtered = searchKeyword
-      ? accounts.filter(a => a.code.includes(searchKeyword) || a.name.includes(searchKeyword))
-      : accounts;
-    const sorted = [...filtered].sort((a, b) => a.code.localeCompare(b.code));
+  // Step 1: Build hierarchy index only when accounts change (O(n²) once)
+  const accountTree = useMemo(() => {
+    const sorted = [...accounts].sort((a, b) => a.code.localeCompare(b.code));
     return sorted.map((acc) => {
       const isLeaf = !sorted.some(
         (child) => child.code.startsWith(acc.code) && child.code.length > acc.code.length
@@ -79,7 +85,15 @@ export default function AccountsSettingsPage() {
 
       return { ...acc, isLeaf, depth, computedBalance };
     });
-  }, [accounts, searchKeyword]);
+  }, [accounts]);
+
+  // Step 2: Keyword filter is O(n), applied to pre-built tree
+  const enhancedAccounts = useMemo(() => {
+    if (!searchKeyword) return accountTree;
+    return accountTree.filter(
+      a => a.code.includes(searchKeyword) || a.name.includes(searchKeyword)
+    );
+  }, [accountTree, searchKeyword]);
 
   const checkTrialBalance = async () => {
     try {
@@ -152,7 +166,7 @@ export default function AccountsSettingsPage() {
     }
 
     try {
-      await apiFetch("/api/v1/accounts/", {
+      await apiFetch("/api/v1/accounts", {
         method: "POST",
         body: JSON.stringify(payload)
       });
@@ -166,6 +180,7 @@ export default function AccountsSettingsPage() {
   const openEditModal = (acc: Account) => {
     setEditAccount(acc);
     setEditName(acc.name);
+    setEditCode(acc.code);
     setEditError("");
     setShowEditModal(true);
   };
@@ -173,10 +188,19 @@ export default function AccountsSettingsPage() {
   const submitEditAccount = async () => {
     if (!editAccount || !editName) return;
     setEditError("");
+    const isSub = editAccount.parent_id != null;
+    if (isSub && editCode && editCode.length < 6) {
+      setEditError("二级/三级科目编码至少6位");
+      return;
+    }
     try {
+      const body: Record<string, unknown> = { name: editName };
+      if (isSub && editCode !== editAccount.code) {
+        body.code = editCode;
+      }
       await apiFetch(`/api/v1/accounts/${editAccount.id}`, {
         method: "PUT",
-        body: JSON.stringify({ name: editName })
+        body: JSON.stringify(body),
       });
       setShowEditModal(false);
       await fetchAccounts();
@@ -241,8 +265,8 @@ export default function AccountsSettingsPage() {
         <div className="p-4 border-b border-slate-100">
           <input
             type="text"
-            value={searchKeyword}
-            onChange={(e) => setSearchKeyword(e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="搜索科目编码或名称..."
             className="border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 w-72"
           />
@@ -293,7 +317,7 @@ export default function AccountsSettingsPage() {
                   )}
                 </td>
                 <td className="px-6 py-4 text-center">
-                  <div className="flex justify-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex justify-center gap-2">
                     <button
                       onClick={() => openEditModal(acc)}
                       className="text-slate-500 hover:text-slate-800 text-xs font-medium px-2 py-1 rounded hover:bg-slate-100 transition-colors"
@@ -433,7 +457,7 @@ export default function AccountsSettingsPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden">
             <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-              <h2 className="text-lg font-bold text-slate-800">编辑科目名称</h2>
+              <h2 className="text-lg font-bold text-slate-800">编辑科目</h2>
               <button onClick={() => setShowEditModal(false)} className="text-slate-400 hover:text-slate-600">
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
@@ -443,10 +467,21 @@ export default function AccountsSettingsPage() {
               {editError && <div className="mb-4 p-3 bg-red-50 text-red-700 text-sm rounded-lg">{editError}</div>}
 
               <div className="mb-4">
-                <label className="block text-sm font-medium text-slate-700 mb-1">科目编码 (不可修改)</label>
-                <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-600 font-mono">
-                  {editAccount.code}
-                </div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">
+                  科目编码{editAccount.parent_id != null ? "" : " (一级科目不可修改)"}
+                </label>
+                {editAccount.parent_id != null ? (
+                  <input
+                    type="text"
+                    value={editCode}
+                    onChange={e => setEditCode(e.target.value.replace(/\D/g, ''))}
+                    className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-slate-900"
+                  />
+                ) : (
+                  <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-600 font-mono">
+                    {editAccount.code}
+                  </div>
+                )}
               </div>
 
               <div className="mb-6">
@@ -466,7 +501,7 @@ export default function AccountsSettingsPage() {
                 </button>
                 <button
                   onClick={submitEditAccount}
-                  disabled={!editName || editName === editAccount.name}
+                  disabled={!editName || (editName === editAccount.name && editCode === editAccount.code)}
                   className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
                 >
                   保存修改

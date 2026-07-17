@@ -1,4 +1,5 @@
 from decimal import Decimal
+import os
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -11,6 +12,23 @@ from app.models.financial import (
 from app.types import Money
 
 router = APIRouter()
+
+# Placeholder LLM keys that mean "not configured"
+_PLACEHOLDER_LLM_KEYS = {"", "sk-your-new-deepseek-key", "sk-your-deepseek-api-key", "sk-xxxxxxxx"}
+
+
+@router.get("/ai-status")
+def get_ai_status():
+    """Report whether AI/LLM features are available.
+
+    Returns available=False when DEEPSEEK_API_KEY is empty or a known placeholder,
+    so the frontend can disable AI entry points with a friendly hint instead of
+    letting users hit a silent failure.
+    """
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    available = key not in _PLACEHOLDER_LLM_KEYS
+    return {"available": available, "provider": "deepseek" if available else None}
+
 
 @router.get("/periods/current")
 def get_current_period(db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id)):

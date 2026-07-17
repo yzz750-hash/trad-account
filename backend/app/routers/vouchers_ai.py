@@ -17,15 +17,22 @@ from app.models.financial import (
     Voucher, VoucherEntry, Account, VoucherStatus, AccountDirection,
     OriginalDocument, OpenItem, OpenItemType, OpenItemStatus,
 )
+from app.services.voucher_rules import (
+    validate_voucher, RuleViolation, check_vat_split, check_payable_amount,
+)
 from app.routers.voucher_utils import (
     AIDebitEntrySchema, AIVoucherResponseSchema,
     BatchGenerateRequest, VoucherResponse,
     _get_llm_config_for_ledger, _call_llm_with_retry,
     _build_3level_debit_account, _build_vendor_account, _infer_category,
-    get_next_voucher_number,
+    _ensure_account_chain, get_next_voucher_number,
+    _match_ai_entries_to_ocr, _process_ai_debit_entries, _build_item_summary,
 )
 
 router = APIRouter()
+
+# 应交税费-应交增值税-进项税额 (standard Chinese chart of accounts)
+VAT_INPUT_CODE = "222101"
 
 
 @router.post("/generate-from-docs", response_model=VoucherResponse)
@@ -120,13 +127,11 @@ Return ONLY JSON:
         raise HTTPException(status_code=502, detail="AI 返回了不符合预期的数据格式，请重试。")
 
     ai_entries = validated.debit_entries
-    credit_code = validated.credit_code
+
+    # Match AI-classified entries to OCR items (fuzzy matching, no position fallback)
+    matched = _match_ai_entries_to_ocr(ai_entries, all_items)
 
     doc_count = len({it["_doc_id"] for it in all_items})
-    unique_vendors = sorted(vendor_totals.keys())
-    vendor_summary = "、".join(unique_vendors)
-    if len(vendor_summary) > 40:
-        vendor_summary = vendor_summary[:37] + "..."
 
     today = date.today()
     check_period_open(db, ledger_id, today.year, today.month)
@@ -141,33 +146,37 @@ Return ONLY JSON:
     db.add(new_voucher)
     db.flush()
 
-    total_debit = Decimal("0.00")
-    for entry_data in ai_entries:
-        root_code = entry_data.account_code
-        amt = entry_data.amount
-        item_name = entry_data.item_name
-        vendor = entry_data.vendor
-        category = entry_data.category or _infer_category(item_name)
-        acct = _build_3level_debit_account(db, ledger_id, root_code, category, item_name)
-        summary = f"{acct.name} - {item_name}"
-        if vendor:
-            summary += f" ({vendor})"
-        db.add(VoucherEntry(
-            voucher_id=new_voucher.id, account_id=acct.id, summary=summary,
-            direction=AccountDirection.DEBIT, amount=amt,
-        ))
-        total_debit += amt
+    # Create debit entries (with VAT splitting where applicable)
+    total_debit, debit_entry_dicts = _process_ai_debit_entries(db, ledger_id, matched, new_voucher.id)
 
+    # Create credit entries: 应付账款 per vendor (含税总金额)
+    credit_entry_dicts: list[dict] = []
     for vendor, vt in vendor_totals.items():
-        acct_credit = _build_vendor_account(db, ledger_id, credit_code, vendor)
+        acct_credit = _build_vendor_account(db, ledger_id, "2202", vendor)
         db.add(VoucherEntry(
             voucher_id=new_voucher.id, account_id=acct_credit.id,
             summary=f"应付货款 - {vendor}", direction=AccountDirection.CREDIT, amount=vt,
         ))
+        credit_entry_dicts.append({"account_code": acct_credit.code, "amount": vt})
 
-    if total_debit.quantize(Decimal("0.01")) != total_amount.quantize(Decimal("0.01")):
+    # --- Accounting rule validation ---
+    violations = validate_voucher(db, ledger_id, debit_entry_dicts, credit_entry_dicts, body.doc_ids)
+    violations.extend(check_vat_split(
+        [{**it, "_vendor": it.get("_vendor", "")} for it in all_items],
+        debit_entry_dicts,
+    ))
+    violations.extend(check_payable_amount(credit_entry_dicts, total_amount))
+
+    errors = [v for v in violations if v.severity == "error"]
+    if errors:
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"AI-generated voucher is unbalanced: debit={total_debit}, credit={total_amount}")
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "凭证违反会计准则", "violations": [{"rule": e.rule, "message": e.message} for e in errors]},
+        )
+    for w in [v for v in violations if v.severity == "warning"]:
+        logger.warning("Accounting rule warning [%s]: %s", w.rule, w.message)
+    # --- End validation ---
 
     for vendor, vt in vendor_totals.items():
         vendor_doc_id = vendor_docs.get(vendor, [None])[0]
@@ -240,8 +249,13 @@ Return ONLY JSON:
         raise HTTPException(status_code=502, detail="AI 返回了不符合预期的数据格式，请重试。")
 
     ai_entries = validated.debit_entries
-    credit_code = validated.credit_code
     vendor_name = doc.extracted_data.get("vendor_name", "未知供应商")
+
+    # Tag OCR items with vendor for matching
+    ocr_items = doc.extracted_data.get("items", [])
+    tagged_items = [{**it, "_vendor": vendor_name, "_doc_id": doc.id} for it in ocr_items]
+
+    matched = _match_ai_entries_to_ocr(ai_entries, tagged_items)
 
     today = date.today()
     check_period_open(db, ledger_id, today.year, today.month)
@@ -251,26 +265,32 @@ Return ONLY JSON:
     db.add(new_voucher)
     db.flush()
 
-    total_debit = Decimal("0.00")
-    for entry_data in ai_entries:
-        root_code = entry_data.account_code
-        amt = entry_data.amount
-        item_name = entry_data.item_name
-        category = entry_data.category or _infer_category(item_name)
-        acct = _build_3level_debit_account(db, ledger_id, root_code, category, item_name)
-        db.add(VoucherEntry(
-            voucher_id=new_voucher.id, account_id=acct.id,
-            summary=f"{acct.name} ({vendor_name})", direction=AccountDirection.DEBIT, amount=amt))
-        total_debit += amt
+    total_debit, debit_entry_dicts = _process_ai_debit_entries(db, ledger_id, matched, new_voucher.id)
 
-    acct_credit = _build_vendor_account(db, ledger_id, credit_code, vendor_name)
+    acct_credit = _build_vendor_account(db, ledger_id, "2202", vendor_name)
     db.add(VoucherEntry(
         voucher_id=new_voucher.id, account_id=acct_credit.id,
         summary=f"应付货款 - {vendor_name}", direction=AccountDirection.CREDIT, amount=total_amount_decimal))
+    credit_entry_dicts = [{"account_code": acct_credit.code, "amount": total_amount_decimal}]
 
-    if total_debit.quantize(Decimal("0.01")) != total_amount_decimal.quantize(Decimal("0.01")):
+    # --- Accounting rule validation ---
+    violations = validate_voucher(db, ledger_id, debit_entry_dicts, credit_entry_dicts, [doc_id])
+    violations.extend(check_vat_split(
+        [{**it, "_vendor": vendor_name} for it in ocr_items],
+        debit_entry_dicts,
+    ))
+    violations.extend(check_payable_amount(credit_entry_dicts, total_amount_decimal))
+
+    errors = [v for v in violations if v.severity == "error"]
+    if errors:
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"AI-generated voucher is unbalanced: debit={total_debit}, credit={total_amount_decimal}")
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "凭证违反会计准则", "violations": [{"rule": e.rule, "message": e.message} for e in errors]},
+        )
+    for w in [v for v in violations if v.severity == "warning"]:
+        logger.warning("Accounting rule warning [%s]: %s", w.rule, w.message)
+    # --- End validation ---
 
     db.add(OpenItem(ledger_id=ledger_id, item_type=OpenItemType.INVOICE,
         source_doc_id=doc.id, date=new_voucher.voucher_date,
@@ -354,8 +374,24 @@ def generate_voucher_from_statement(doc_id: int, db: Session = Depends(get_db), 
     db.add(new_voucher)
     db.flush()
 
+    # Compute the authoritative total from the OCR'd bank statement BEFORE
+    # trusting AI-generated entry amounts. AI may hallucinate, drop, or
+    # duplicate transactions; the resulting voucher must reconcile to the
+    # source document to within rounding tolerance or we refuse to commit.
+    source_total = Decimal("0.00")
+    for t in transactions:
+        try:
+            source_total += abs(Decimal(str(t.get("amount", "0") or "0")))
+        except Exception:
+            # Malformed amount in source data — already validated upstream,
+            # but defend against silent corruption by skipping rather than
+            # crashing the whole voucher generation.
+            continue
+
     total_debit = Decimal("0.00")
     total_credit = Decimal("0.00")
+    debit_entry_dicts: list[dict] = []
+    credit_entry_dicts: list[dict] = []
     for idx, entry in enumerate(ai_entries):
         amt = Decimal(str(entry.get("amount", 0)))
         is_receipt = entry.get("is_receipt", True)
@@ -379,20 +415,46 @@ def generate_voucher_from_statement(doc_id: int, db: Session = Depends(get_db), 
             account_id=bank_acc.id if is_receipt else cp_acc.id,
             summary=remarks, direction=AccountDirection.DEBIT, amount=amt))
         total_debit += amt
+        debit_entry_dicts.append({"account_code": bank_acc.code if is_receipt else cp_acc.code, "amount": amt})
+
         db.add(VoucherEntry(
             voucher_id=new_voucher.id,
             account_id=cp_acc.id if is_receipt else bank_acc.id,
             summary=remarks, direction=AccountDirection.CREDIT, amount=amt))
         total_credit += amt
+        credit_entry_dicts.append({"account_code": cp_acc.code if is_receipt else bank_acc.code, "amount": amt})
 
         db.add(OpenItem(ledger_id=ledger_id, item_type=OpenItemType.BANK_TXN,
             source_doc_id=doc.id, txn_index=idx, date=new_voucher.voucher_date,
             counterpart_name=entry.get("counterpart_code", "未知对方户名"),
             remarks=remarks, amount=amt, unreconciled_amount=amt, status=OpenItemStatus.OPEN))
 
-    if total_debit.quantize(Decimal("0.01")) != total_credit.quantize(Decimal("0.01")):
+    # Reconciliation check: AI-generated voucher must match the source bank
+    # statement total. A discrepancy means the AI dropped/added/mis-sized a
+    # transaction — committing the voucher would silently misstate the books.
+    # 0.01 tolerance for Decimal rounding on each line.
+    amount_diff = abs(total_debit - source_total)
+    if amount_diff > Decimal("0.01"):
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"AI-generated bank statement voucher is unbalanced: debit={total_debit}, credit={total_credit}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"AI 生成的凭证金额 {total_debit:.2f} 与银行流水原始金额 {source_total:.2f} 不一致"
+                f"（差异 {amount_diff:.2f}），已拒绝生成凭证。请重新生成或人工核对。"
+            ),
+        )
+
+    # --- Accounting rule validation ---
+    violations = validate_voucher(db, ledger_id, debit_entry_dicts, credit_entry_dicts, [doc_id])
+    errors = [v for v in violations if v.severity == "error"]
+    if errors:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "凭证违反会计准则", "violations": [{"rule": e.rule, "message": e.message} for e in errors]},
+        )
+    for w in [v for v in violations if v.severity == "warning"]:
+        logger.warning("Accounting rule warning [%s]: %s", w.rule, w.message)
 
     doc.is_reconciled = False
     db.commit()

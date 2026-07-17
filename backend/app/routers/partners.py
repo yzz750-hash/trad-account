@@ -28,7 +28,7 @@ class PartnerUpdate(BaseModel):
     is_active: bool | None = None
 
 
-@router.get("/", response_model=list[PartnerSchema])
+@router.get("", response_model=list[PartnerSchema])
 def get_partners(db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id)):
     partners = db.query(BusinessPartner).filter(
         BusinessPartner.ledger_id == ledger_id,
@@ -37,7 +37,7 @@ def get_partners(db: Session = Depends(get_db), ledger_id: int = Depends(get_led
     return [PartnerSchema.model_validate(p) for p in partners]
 
 
-@router.post("/", response_model=PartnerSchema)
+@router.post("", response_model=PartnerSchema)
 def create_partner(
     partner: PartnerCreate,
     db: Session = Depends(get_db),

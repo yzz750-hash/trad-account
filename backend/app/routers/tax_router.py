@@ -99,13 +99,18 @@ class ExportRebateResponse(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────
 
 def _get_active_rate(db: Session, ledger_id: int, tax_type: str) -> Decimal:
-    """Return the active tax rate for a given type, or the default."""
+    """Return the active tax rate for a given type, or the default.
+
+    只选取 effective_from <= today 的税率，避免未来生效的税率被提前使用。
+    """
+    today = date.today()
     rate_row = (
         db.query(TaxRate)
         .filter(
             TaxRate.ledger_id == ledger_id,
             TaxRate.tax_type == tax_type,
             TaxRate.is_active == True,
+            TaxRate.effective_from <= today,
         )
         .order_by(TaxRate.effective_from.desc())
         .first()
@@ -495,10 +500,13 @@ def create_vat_payable_voucher(
         db.add(vat_unpaid_acc)
         db.flush()
 
+    # 使用月末最后一天作为凭证日期，避免漏算 29-31 号
+    import calendar as _cal
+    _, _last_day = _cal.monthrange(req.year, req.month)
     v = Voucher(
         ledger_id=ledger_id,
         voucher_number=get_next_voucher_number(db, ledger_id, "税-"),
-        voucher_date=date(req.year, req.month, 28),
+        voucher_date=date(req.year, req.month, _last_day),
         status=VoucherStatus.DRAFT,
     )
     db.add(v)

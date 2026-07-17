@@ -53,6 +53,8 @@ SYSTEM_PROMPT = """
 {"intent": "INVOICE_OCR", "file_path": "发票的路径或地址"}
 如果用户要求"核销"、"对账"、"开始对账"、"智能核销"，请返回格式如下：
 {"intent": "RECONCILE"}
+如果用户描述了一笔经济业务并希望生成会计凭证（例如："收到XX公司货款72000元"、"支付本月工资"、"购买办公用品500元"、"计提本月折旧"、"报销差旅费1000元"等），请返回格式如下：
+{"intent": "CREATE_VOUCHER"}
 如果是一般聊天，请返回：
 {"intent": "CHAT", "reply": "你的回复内容"}
 """
@@ -275,6 +277,20 @@ async def handle_ai_chat(
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(reconcile(), media_type="text/event-stream")
+
+    elif intent == "CREATE_VOUCHER":
+        if current_user.role not in ("admin", "accountant"):
+            async def no_perm_voucher():
+                msg = json.dumps({"type": "error", "text": "抱歉，您没有权限生成凭证。"}, ensure_ascii=False)
+                yield f"data: {msg}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(no_perm_voucher(), media_type="text/event-stream")
+
+        from app.routers.voucher_nl import create_voucher_suggestion
+        return StreamingResponse(
+            create_voucher_suggestion(db, ledger_id, config, user_msg),
+            media_type="text/event-stream",
+        )
 
     else:  # CHAT
         messages = _build_chat_messages(request.history, user_msg)

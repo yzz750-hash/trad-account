@@ -27,7 +27,7 @@ from app.services import voucher_service as svc
 router = APIRouter()
 
 
-@router.post("/", response_model=VoucherResponse)
+@router.post("", response_model=VoucherResponse)
 def create_voucher(voucher_data: VoucherCreate, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), _: None = Depends(require_write)):
     """Create a new accounting voucher, ensuring debit equals credit."""
     entries = [
@@ -43,6 +43,14 @@ def create_voucher(voucher_data: VoucherCreate, db: Session = Depends(get_db), l
         }
         for e in voucher_data.entries
     ]
+
+    # Lock ordering: AccountingPeriod → VoucherNumberCounter → Voucher.
+    # reverse_voucher locks in this same order; mixing orders between endpoints
+    # creates a classic AB-BA deadlock under concurrent load. We pre-check the
+    # period here so the counter lock is acquired AFTER the period lock.
+    # svc.create_voucher will re-check the period (idempotent under row locks
+    # held by the same transaction) before inserting the voucher.
+    svc.check_period_for_date(db, ledger_id, voucher_data.voucher_date)
 
     if not voucher_data.voucher_number or voucher_data.voucher_number.startswith("AUTO"):
         v_num = get_next_voucher_number(db, ledger_id)
@@ -67,7 +75,7 @@ def unpost_voucher(voucher_id: int, db: Session = Depends(get_db), ledger_id: in
     return {"status": "success", "message": f"Voucher {v.voucher_number} returned to draft."}
 
 
-@router.get("/", response_model=VoucherResponsePage)
+@router.get("", response_model=VoucherResponsePage)
 def list_vouchers(
     search: Optional[str] = Query(None, description="Fuzzy search voucher_number and entry summary"),
     status: Optional[str] = Query(None, description="Filter by status (DRAFT/POSTED)"),
@@ -210,6 +218,18 @@ def batch_review_vouchers(body: BatchVoucherRequest, db: Session = Depends(get_d
 def batch_unpost_vouchers(body: BatchVoucherRequest, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), _: None = Depends(require_write)):
     unposted, errors = svc.batch_unpost_vouchers(db, ledger_id, body.voucher_ids)
     return {"unposted_count": len(unposted), "failed_count": len(errors), "errors": errors}
+
+
+@router.delete("/{voucher_id}")
+def delete_draft_voucher(voucher_id: int, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), _: None = Depends(require_write)):
+    v = db.query(Voucher).filter(Voucher.ledger_id == ledger_id, Voucher.id == voucher_id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Voucher not found")
+    if v.status != VoucherStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Only DRAFT vouchers can be deleted")
+    db.delete(v)
+    db.commit()
+    return {"status": "success", "message": f"Voucher {v.voucher_number} deleted"}
 
 
 @router.get("/{voucher_id}/print")

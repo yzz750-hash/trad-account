@@ -1,6 +1,8 @@
 # Root
+.env
 .vscode/
 .claude/
+secrets/
 
 # Database
 *.db
@@ -28,3 +30,11 @@ frontend/.env.local
 frontend/out/
 frontend/*.tsbuildinfo
 .gstack/
+
+# Security — session tokens / cookies (never commit)
+backend/cookies.txt
+*.cookie
+*.token
+
+# IDE / tooling
+.codegraph/

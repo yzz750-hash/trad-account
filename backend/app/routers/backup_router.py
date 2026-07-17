@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -33,6 +33,11 @@ logger = logging.getLogger("trad_account.backup")
 BACKUP_DIR = Path(__file__).resolve().parent.parent.parent / "backups"
 UPLOADS_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 
+# Retention policy for manual backups created via the API. Older manual
+# backups beyond this count are auto-deleted when a new one is created.
+# Auto-backups (auto_*) and pre-restore safety backups are excluded.
+MANUAL_BACKUPS_KEEP = 10
+
 
 def _resolve_db_path() -> str:
     """Resolve the SQLite database file path from DATABASE_URL.
@@ -40,7 +45,7 @@ def _resolve_db_path() -> str:
     Handles both relative (sqlite:///./db) and absolute (sqlite:///C:/db) URLs.
     """
     parsed = urlparse(DATABASE_URL)
-    db_path = parsed.path  # e.g. /C:/path/db or ./financial.db
+    db_path = parsed.path  # e.g. /C:/path/db or /./financial.db
 
     # On Windows, urlparse of sqlite:///C:/... gives path as /C:/...
     # Normalize: strip leading / for Windows absolute paths like /C:/ or /C:\
@@ -50,6 +55,13 @@ def _resolve_db_path() -> str:
     if os.path.isabs(db_path):
         return os.path.normpath(db_path)
 
+    # Relative path: urlparse adds a leading / to sqlite:///./path (giving
+    # "/./financial.db"). Strip it so os.path.join doesn't treat it as a
+    # drive-root absolute path on Windows (which would resolve to D:\...
+    # instead of <backend>/financial.db).
+    if db_path.startswith('/'):
+        db_path = db_path.lstrip('/')
+
     # Relative path: resolve from backend directory
     return os.path.normpath(os.path.join(os.path.dirname(BACKUP_DIR), db_path))
 
@@ -58,6 +70,19 @@ _PG_DUMP_CMD = os.environ.get("PG_DUMP_PATH", "pg_dump")
 _PSQL_CMD = os.environ.get("PSQL_PATH", "psql")
 _PG_RESTORE_CMD = os.environ.get("PG_RESTORE_PATH", "pg_restore")
 _POSTGRES_CONTAINER = os.environ.get("POSTGRES_CONTAINER", "postgres")
+
+# Docker container names allow [a-zA-Z0-9][a-zA-Z0-9_.-]*. We reject anything
+# outside this set because _POSTGRES_CONTAINER is interpolated into a
+# `wsl bash -c "docker exec ... <container> ..."` string; shell metacharacters
+# in the env var would be a remote-code-execution vector. This guards both the
+# restore path (line ~237) and the version-detection probes in _resolve_pg_tool.
+_CONTAINER_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+if not _CONTAINER_NAME_RE.match(_POSTGRES_CONTAINER):
+    raise RuntimeError(
+        f"Invalid POSTGRES_CONTAINER value { _POSTGRES_CONTAINER!r}: "
+        "must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ (Docker container name rules). "
+        "Refusing to start with a value that could allow shell injection."
+    )
 
 
 def _resolve_pg_tool(tool: str, default_path: str) -> list[str]:
@@ -434,6 +459,22 @@ def create_backup(
     size = zip_path.stat().st_size
     logger.info("Backup created: %s (%d bytes)", backup_id, size)
 
+    # Auto-cleanup old manual backups. Keep only the most recent
+    # MANUAL_BACKUPS_KEEP files with the "backup_" prefix. Auto-backups
+    # (auto_*) are managed by auto_backup.py; pre_restore_* safety backups
+    # are preserved as restore rollback points and never auto-deleted here.
+    manual_files = sorted(
+        BACKUP_DIR.glob("backup_*.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in manual_files[MANUAL_BACKUPS_KEEP:]:
+        try:
+            old.unlink()
+            logger.info("Auto-cleaned old manual backup: %s", old.name)
+        except OSError as exc:
+            logger.warning("Failed to clean old backup %s: %s", old.name, exc)
+
     return BackupInfo(
         id=backup_id,
         filename=zip_path.name,
@@ -600,3 +641,61 @@ def restore_backup(
     except Exception as e:
         logger.error("Restore failed: %s", e)
         raise HTTPException(status_code=500, detail="Restore failed due to an internal error")
+
+
+@router.delete("/backups/{backup_id}")
+def delete_backup(
+    backup_id: str,
+    current_user: CurrentUser = Depends(require_admin),
+):
+    """Delete a backup file (admin only)."""
+    _sanitize_backup_id(backup_id)
+    zip_path = BACKUP_DIR / f"{backup_id}.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Backup not found")
+    zip_path.unlink()
+    logger.info("Backup deleted: %s (by %s)", backup_id, current_user.username)
+    return {"status": "success", "message": f"Backup {backup_id} deleted"}
+
+
+@router.post("/backups/upload")
+def upload_backup(
+    file: UploadFile = File(...),
+    current_user: CurrentUser = Depends(require_admin),
+):
+    """Upload a backup ZIP file from another system (admin only)."""
+    _ensure_dir()
+    # Sanitize filename
+    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename or "uploaded_backup.zip")
+    backup_id = safe_name.replace(".zip", "")
+    dest_path = BACKUP_DIR / f"{backup_id}.zip"
+
+    # Verify it's a valid zip with manifest
+    content = file.file.read()
+    file.file.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            if "manifest.json" not in zf.namelist():
+                raise HTTPException(status_code=400, detail="Invalid backup: no manifest.json found")
+        shutil.move(tmp_path, str(dest_path))
+    except HTTPException:
+        os.unlink(tmp_path)
+        raise
+    except Exception:
+        os.unlink(tmp_path)
+        raise HTTPException(status_code=400, detail="Invalid backup: not a valid ZIP file")
+
+    stat = dest_path.stat()
+    manifest = _read_manifest(dest_path)
+    checksum = manifest.get("db_checksum", "") if manifest else ""
+    logger.info("Backup uploaded: %s (%d bytes, by %s)", backup_id, stat.st_size, current_user.username)
+    return BackupInfo(
+        id=backup_id,
+        filename=dest_path.name,
+        size_bytes=stat.st_size,
+        created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        db_checksum=checksum,
+    )

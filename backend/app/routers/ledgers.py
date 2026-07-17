@@ -34,7 +34,7 @@ class LedgerUpdate(BaseModel):
     name: Optional[str] = None
     company_name: Optional[str] = None
 
-@router.post("/", response_model=LedgerResponse)
+@router.post("", response_model=LedgerResponse)
 def create_ledger(
     ledger_in: LedgerCreate,
     db: Session = Depends(get_db),
@@ -102,7 +102,7 @@ def create_ledger(
     db.commit()
     return ledger
 
-@router.get("/", response_model=List[LedgerResponse])
+@router.get("", response_model=List[LedgerResponse])
 def get_ledgers(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
@@ -187,13 +187,25 @@ def delete_ledger(
     db.query(Salesperson).filter(Salesperson.ledger_id == ledger_id).delete(synchronize_session=False)
     db.query(TaxRate).filter(TaxRate.ledger_id == ledger_id).delete(synchronize_session=False)
     db.query(VoucherNumberCounter).filter(VoucherNumberCounter.ledger_id == ledger_id).delete(synchronize_session=False)
-    db.query(AuditLog).filter(AuditLog.ledger_id == ledger_id).delete(synchronize_session=False)
+    # Audit logs MUST be retained for compliance (等保2.0三级 / SOX-style retention).
+    # Instead of deleting them, we null out the ledger_id FK so the log rows
+    # survive but no longer reference the deleted ledger. The deletion event
+    # itself is also recorded as a new audit log entry below.
+    db.query(AuditLog).filter(AuditLog.ledger_id == ledger_id).update(
+        {AuditLog.ledger_id: None},
+        synchronize_session=False,
+    )
     db.query(Account).filter(Account.ledger_id == ledger_id).delete(synchronize_session=False)
     db.query(AccountingPeriod).filter(AccountingPeriod.ledger_id == ledger_id).delete(synchronize_session=False)
 
     db.delete(ledger)
     db.commit()
-    return {"status": "success", "message": "Ledger deleted"}
+    logger.warning(
+        "Ledger '%s' (id=%s) deleted by user %s. Audit logs for this ledger "
+        "were preserved with ledger_id=NULL for compliance retention.",
+        ledger.name, ledger_id, current_user.username,
+    )
+    return {"status": "success", "message": "Ledger deleted. Audit logs retained for compliance."}
 
 # Dependency for other routers — now enforces ledger-level authorization
 def get_ledger_id(

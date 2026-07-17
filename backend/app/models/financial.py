@@ -1,4 +1,4 @@
-﻿from sqlalchemy import (
+from sqlalchemy import (
     Column,
     Integer,
     String,
@@ -11,6 +11,7 @@
     Enum,
     DateTime,
     UniqueConstraint,
+    CheckConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -91,7 +92,7 @@ class Account(Base):
     account_type = Column(Enum(AccountType), nullable=False)
     balance_direction = Column(Enum(AccountDirection), nullable=False)
 
-    opening_balance = Column(Numeric(15, 2), default=0.00)
+    opening_balance = Column(Numeric(15, 2), default=0.00, nullable=False)
     is_active = Column(Boolean, default=True)
 
     children = relationship("Account", backref="parent", remote_side=[id])
@@ -114,8 +115,8 @@ class Voucher(Base):
     ledger_id = Column(Integer, ForeignKey("ledgers.id"), nullable=False, index=True)
     voucher_number = Column(String(50), index=True, nullable=False)
     voucher_date = Column(Date, nullable=False, index=True)
-    attachments_count = Column(Integer, default=0)
-    status = Column(Enum(VoucherStatus), default=VoucherStatus.DRAFT)
+    attachments_count = Column(Integer, default=0, nullable=False)
+    status = Column(Enum(VoucherStatus), default=VoucherStatus.DRAFT, nullable=False)
 
     source_type = Column(String(50), nullable=True)
     contract_number = Column(String(100), nullable=True)
@@ -139,15 +140,23 @@ class VoucherEntry(Base):
     direction = Column(Enum(AccountDirection), nullable=False)
     amount = Column(Numeric(15, 2), nullable=False)
 
-    currency_code = Column(String(10), default="CNY")
+    currency_code = Column(String(10), default="CNY", nullable=False)
     original_amount = Column(Numeric(15, 2), nullable=True)
-    exchange_rate = Column(Numeric(10, 4), default=1.0000)
+    exchange_rate = Column(Numeric(10, 4), default=1.0000, nullable=False)
 
     vat_rate = Column(Numeric(5, 4), nullable=True)  # e.g. 0.13 for 13% VAT
     vat_amount = Column(Numeric(15, 2), nullable=True)  # VAT portion of this entry
 
     voucher = relationship("Voucher", back_populates="entries")
     account = relationship("Account")
+
+    __table_args__ = (
+        # Amount must be positive — direction (DEBIT/CREDIT) encodes sign.
+        # A zero or negative amount would break double-entry balancing.
+        CheckConstraint("amount > 0", name="ck_voucher_entry_amount_positive"),
+        # Exchange rate must be positive (1.0 for base currency).
+        CheckConstraint("exchange_rate > 0", name="ck_voucher_entry_exchange_rate_positive"),
+    )
 
 
 class OriginalDocument(Base):
@@ -173,11 +182,25 @@ class FixedAsset(Base):
 
     purchase_date = Column(Date, nullable=False)
     original_value = Column(Numeric(15, 2), nullable=False)
-    salvage_value_rate = Column(Numeric(5, 4), default=0.0500)
+    salvage_value_rate = Column(Numeric(5, 4), default=0.0500, nullable=False)
     expected_useful_months = Column(Integer, nullable=False)
 
-    accumulated_depreciation = Column(Numeric(15, 2), default=0.00)
+    accumulated_depreciation = Column(Numeric(15, 2), default=0.00, nullable=False)
     is_active = Column(Boolean, default=True)
+
+    __table_args__ = (
+        # Prevent duplicate asset codes within the same ledger. Without this,
+        # concurrent imports could create two assets with the same code and
+        # silently corrupt depreciation calculations.
+        UniqueConstraint("ledger_id", "asset_code", name="uq_fixed_asset_ledger_code"),
+        # Financial sanity checks — without these, a bad import could create
+        # an asset with negative value or 0-month useful life, crashing
+        # depreciation with a divide-by-zero.
+        CheckConstraint("original_value >= 0", name="ck_fixed_asset_original_value_nonneg"),
+        CheckConstraint("salvage_value_rate >= 0 AND salvage_value_rate < 1", name="ck_fixed_asset_salvage_rate_range"),
+        CheckConstraint("expected_useful_months > 0", name="ck_fixed_asset_useful_months_positive"),
+        CheckConstraint("accumulated_depreciation >= 0", name="ck_fixed_asset_accum_deprec_nonneg"),
+    )
 
 
 class AccountingPeriod(Base):
@@ -208,6 +231,17 @@ class ExchangeRate(Base):
     currency_id = Column(Integer, ForeignKey("currencies.id"), nullable=False, index=True)
     rate = Column(Numeric(12, 8), nullable=False)
 
+    __table_args__ = (
+        # One rate per (period, currency). Without this, FX revaluation could
+        # pick an arbitrary row when duplicates exist, producing non-deterministic
+        # adjustments.
+        UniqueConstraint("period_id", "currency_id", name="uq_exchange_rate_period_currency"),
+        # Exchange rate must be positive. A zero or negative rate would
+        # produce nonsensical FX adjustments and could be used to manipulate
+        # reported balances.
+        CheckConstraint("rate > 0", name="ck_exchange_rate_positive"),
+    )
+
 
 class BusinessPartner(Base):
     __tablename__ = "business_partners"
@@ -217,6 +251,13 @@ class BusinessPartner(Base):
     name = Column(String(255), nullable=False)
     partner_type = Column(Enum(PartnerType), nullable=False)
     is_active = Column(Boolean, default=True)
+
+    __table_args__ = (
+        # Prevent duplicate partner codes within the same ledger. Duplicate
+        # codes would split a single vendor/customer's balance across rows
+        # and break reconciliation.
+        UniqueConstraint("ledger_id", "code", name="uq_business_partner_ledger_code"),
+    )
 
 
 class OpenItemType(enum.Enum):
@@ -309,6 +350,17 @@ class TaxRate(Base):
     effective_to = Column(Date, nullable=True)  # NULL = currently effective
     is_active = Column(Boolean, default=True)
 
+    __table_args__ = (
+        # Tax rate must be in [0, 1]. A rate > 1 (e.g. 130%) would be a data
+        # entry error; a negative rate is nonsensical.
+        CheckConstraint("rate >= 0 AND rate <= 1", name="ck_tax_rate_range"),
+        # effective_to, when set, must be after effective_from.
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to >= effective_from",
+            name="ck_tax_rate_effective_period_valid",
+        ),
+    )
+
 
 class VATRecord(Base):
     """Tracks VAT amounts per voucher for tax reporting / 纳税申报."""
@@ -361,6 +413,13 @@ class Salesperson(Base):
     name = Column(String(255), nullable=False)
     department = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
+
+    __table_args__ = (
+        # Prevent duplicate employee IDs within the same ledger. Commission
+        # calculations join on salesperson_id; duplicates would double-count
+        # or misattribute commissions.
+        UniqueConstraint("ledger_id", "employee_id", name="uq_salesperson_ledger_employee_id"),
+    )
 
 
 class ContractStatus(enum.Enum):

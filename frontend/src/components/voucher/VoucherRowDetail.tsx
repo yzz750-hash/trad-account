@@ -18,12 +18,13 @@ interface Props {
   onUpdateEntry: (index: number, field: string, value: string | number) => void;
   onToggleInvoice: () => void;
   onReverse: (id: number) => void;
+  onDelete: (id: number) => void;
 }
 
 export default function VoucherRowDetail({
   voucher: v, isEditing, editEntries, accounts, showInvoiceId,
   onStartEditing, onCancelEditing, onSaveEditing, onPostVoucher, onUnpostVoucher,
-  onUpdateEntry, onToggleInvoice, onReverse,
+  onUpdateEntry, onToggleInvoice, onReverse, onDelete,
 }: Props) {
   const router = useRouter();
 
@@ -38,6 +39,7 @@ export default function VoucherRowDetail({
                 <>
                   <button onClick={() => onStartEditing(v)} className="px-3 py-1 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-medium hover:bg-slate-50 transition-colors">编辑凭证</button>
                   <button onClick={() => onPostVoucher(v.id)} className="px-3 py-1 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-700 transition-colors">审核并过账</button>
+                  <button onClick={() => onDelete(v.id)} className="px-3 py-1 bg-white border border-red-300 text-red-600 rounded-lg text-xs font-medium hover:bg-red-50 transition-colors">删除</button>
                 </>
               )}
               {isEditing && (

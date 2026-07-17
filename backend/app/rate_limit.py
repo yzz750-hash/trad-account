@@ -123,20 +123,38 @@ class HybridRateLimiter:
     In production with REDIS_URL configured, refuses to fall back to in-memory
     — a Redis outage returns 429 rather than silently degrading to per-process
     limits that an attacker can bypass by spreading across workers.
+
+    In development WITHOUT an explicit REDIS_URL, Redis is skipped entirely to
+    avoid spamming the log with connection failures on every request.
     """
 
     def __init__(self, redis_url: str = REDIS_URL):
-        self._redis = RedisRateLimiter(redis_url)
         self._fallback = InMemoryRateLimiter()
         self._redis_available = None  # tri-state: None=unknown, True, False
         self._last_retry_at: float = 0.0
         self._retry_interval: float = 60.0  # retry Redis every 60s after failure
-        self._fail_closed = (
-            os.environ.get("ENVIRONMENT") == "production"
-            and bool(os.environ.get("REDIS_URL"))
-        )
+
+        # Decide whether Redis should be attempted at all.
+        _env = os.environ.get("ENVIRONMENT", "development")
+        _redis_url_explicit = bool(os.environ.get("REDIS_URL"))
+        self._skip_redis = (_env != "production") and (not _redis_url_explicit)
+
+        if self._skip_redis:
+            # Dev mode without Redis — go straight to in-memory, no connection noise.
+            self._redis = None
+            self._redis_available = False
+            logger.info("Rate limiter: in-memory mode (dev, no REDIS_URL configured)")
+        else:
+            self._redis = RedisRateLimiter(redis_url)
+            self._fail_closed = (
+                _env == "production"
+                and _redis_url_explicit
+            )
 
     async def check(self, key: str, max_rpm: int, window_s: float = 60.0) -> tuple[bool, float]:
+        if self._skip_redis:
+            return self._fallback.check(key, max_rpm, window_s)
+
         if self._redis_available is not False:
             try:
                 allowed, retry = await self._redis.check(key, max_rpm, window_s)
@@ -165,6 +183,8 @@ class HybridRateLimiter:
     def reset(self):
         self._fallback.reset()
         self._redis_available = None
+        if self._skip_redis or self._redis is None:
+            return
         # Also flush Redis rate-limit keys (sync client to avoid async in sync context)
         try:
             import redis
@@ -200,3 +220,28 @@ def get_limiter() -> HybridRateLimiter:
     if _limiter is None:
         _limiter = HybridRateLimiter()
     return _limiter
+
+
+def _check_redis_health() -> bool:
+    """Synchronous Redis health probe for the /health endpoint.
+
+    Returns True if Redis is reachable and responsive, False otherwise.
+    Uses a short-lived sync client so we don't depend on the async limiter's
+    connection state (which may be in fallback mode).
+
+    In dev mode without REDIS_URL configured, returns True (in-memory mode
+    is the intended configuration, not a degraded state).
+    """
+    if os.environ.get("ENVIRONMENT", "development") != "production" and not os.environ.get("REDIS_URL"):
+        return True  # dev mode intentionally has no Redis
+    try:
+        import redis
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=False, socket_timeout=1.0, socket_connect_timeout=1.0)
+        try:
+            client.ping()
+            return True
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.warning("Redis health check failed: %s", exc)
+        return False

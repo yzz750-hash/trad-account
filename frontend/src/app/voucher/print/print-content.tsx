@@ -207,8 +207,8 @@ export default function PrintContent({ voucherId }: PrintContentProps) {
 
       {/* Printable Area */}
       <div
-        className="bg-white shadow-2xl print:shadow-none mx-auto relative overflow-hidden transition-all duration-300"
-        style={{ width: currentSize.width, height: currentSize.height }}
+        className="bg-white shadow-2xl print:shadow-none mx-auto relative overflow-hidden print:overflow-visible transition-all duration-300"
+        style={{ width: currentSize.width, minHeight: currentSize.height }}
       >
         {loading ? (
           <div className="h-full flex items-center justify-center">
@@ -237,7 +237,7 @@ export default function PrintContent({ voucherId }: PrintContentProps) {
             </div>
           </div>
         ) : data ? (
-          <div className="p-8 h-full flex flex-col border border-slate-200 print:border-none">
+          <div className="p-8 min-h-full flex flex-col border border-slate-200 print:border-none">
             {/* Header */}
             <div className="text-center mb-6 relative">
               <h1 className="text-2xl font-bold tracking-widest text-slate-900">

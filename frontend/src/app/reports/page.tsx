@@ -222,12 +222,16 @@ export default function ReportsDashboard() {
   useEffect(() => {
     if (activeTab === "balance") {
       fetchBalanceSheet();
-    } else if (activeTab === "income") {
+    }
+  }, [activeTab, asOfDate, currentLedgerId]);
+
+  useEffect(() => {
+    if (activeTab === "income") {
       fetchIncomeStatement();
     } else if (activeTab === "cash") {
       fetchCashFlow();
     }
-  }, [activeTab, asOfDate, startDate, endDate, currentLedgerId]);
+  }, [activeTab, startDate, endDate, currentLedgerId]);
 
   useEffect(() => {
     if (activeTab === "commission") {
@@ -543,7 +547,7 @@ export default function ReportsDashboard() {
                   <div className="text-slate-500 text-sm font-medium mb-1 relative z-10">总费用 (Total Expenses)</div>
                   <div className="text-3xl font-bold font-mono text-slate-800 tracking-tight relative z-10">{formatMoney(isData.total_expense)}</div>
                 </div>
-                <div className={`p-6 rounded-xl shadow-lg text-white ${Number(isData.net_income) >= 0 ? 'bg-gradient-to-br from-emerald-500 to-emerald-600' : 'bg-gradient-to-br from-rose-500 to-rose-600'}`}>
+                <div className={`p-6 rounded-xl shadow-lg text-white ${d(isData.net_income).gte(0) ? 'bg-gradient-to-br from-emerald-500 to-emerald-600' : 'bg-gradient-to-br from-rose-500 to-rose-600'}`}>
                   <div className="text-white/80 text-sm font-medium mb-1">净利润 (Net Income)</div>
                   <div className="text-3xl font-bold font-mono tracking-tight">{formatMoney(isData.net_income)}</div>
                 </div>

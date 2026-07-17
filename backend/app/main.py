@@ -31,16 +31,27 @@ from app.logging_config import setup_logging
 from app.database import get_db
 from sqlalchemy.orm import Session
 from app.routers import ai_chat, reports, vouchers, closing, accounts, system, partners, ledgers, auth_router, export, user_router, tax_router, audit_router, backup_router
+from app.routers.vouchers_crud import router as vouchers_crud_router
+from app.routers.vouchers_ai import router as vouchers_ai_router
+from app.routers.reconciliation import router as reconciliation_router
+from app.routers.vouchers_upload import router as vouchers_upload_router
 
 setup_logging()
 logger = logging.getLogger("trad_account")
 
-# Production safety check: warn if default credentials are still in use
+# Allow Next.js frontend to communicate with FastAPI
+# Configure ALLOWED_ORIGINS env var as comma-separated list (e.g. "https://app.example.com,https://admin.example.com")
+# NOTE: must be defined BEFORE the production safety check below references it.
+_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
+_allowed_origins = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+
+# Production safety check: refuse to boot if insecure defaults are still in use
 _DEFAULT_PASSWORDS = {"admin123", "accountant1", "auditor123", "change-me-admin", "change-me-accountant", "change-me-auditor"}
 _admin_pw = os.environ.get("ADMIN_PASSWORD", "")
 _accountant_pw = os.environ.get("ACCOUNTANT_PASSWORD", "")
 _auditor_pw = os.environ.get("AUDITOR_PASSWORD", "")
 _PROHIBITED_JWT_KEYS = {"YOUR_JWT_SECRET_CHANGE_IN_PRODUCTION", "generate-a-real-64-char-hex-string", "test-jwt-secret-key-for-testing-only"}
+_PLACEHOLDER_LLM_KEYS = {"", "sk-your-new-deepseek-key", "sk-your-deepseek-api-key", "sk-xxxxxxxx"}
 
 if os.environ.get("ENVIRONMENT") == "production":
     if _admin_pw in _DEFAULT_PASSWORDS:
@@ -51,20 +62,29 @@ if os.environ.get("ENVIRONMENT") == "production":
         raise RuntimeError("AUDITOR_PASSWORD is set to a default value! Change it immediately.")
     if os.environ.get("JWT_SECRET_KEY", "") in _PROHIBITED_JWT_KEYS:
         raise RuntimeError("JWT_SECRET_KEY is set to a placeholder value! Change it immediately.")
+    if not os.environ.get("ENCRYPTION_KEY", "").strip():
+        raise RuntimeError("ENCRYPTION_KEY must be set to a non-empty value in production.")
     if "*" in _allowed_origins:
         raise RuntimeError("ALLOWED_ORIGINS must not contain '*' in production. Specify exact origins.")
+    if os.environ.get("DEEPSEEK_API_KEY", "") in _PLACEHOLDER_LLM_KEYS:
+        logger.warning("DEEPSEEK_API_KEY is not configured — AI voucher / chat features will be unavailable.")
+else:
+    # Development mode: warn once at startup so the operator knows AI features are disabled.
+    if os.environ.get("DEEPSEEK_API_KEY", "") in _PLACEHOLDER_LLM_KEYS:
+        logger.warning("DEEPSEEK_API_KEY is a placeholder or empty — AI voucher OCR / chat will fail. Set a real key in .env to enable.")
 
 app = FastAPI(
     title="Intelligent Foreign Trade Financial API",
     description="API for the China foreign trade financial software with Agnostic LLM and Multi-ledger.",
     version="1.0.0",
     default_response_class=DecimalAwareJSONResponse,
+    # Disable automatic slash redirection. When the Next.js dev server proxies
+    # /api/* requests via rewrites, a 307 redirect makes the proxy follow
+    # server-side WITHOUT forwarding the browser's cookies → 401. With this
+    # disabled, routes must match the exact path (collection routes use "" so
+    # they live at /api/v1/foo, not /api/v1/foo/).
+    redirect_slashes=False,
 )
-
-# Allow Next.js frontend to communicate with FastAPI
-# Configure ALLOWED_ORIGINS env var as comma-separated list (e.g. "https://app.example.com,https://admin.example.com")
-_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
-_allowed_origins = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -231,7 +251,10 @@ _auth = [Depends(get_current_user)]
 
 app.include_router(ai_chat.router, prefix="/api/v1/ai", tags=["AI Agent"], dependencies=_auth)
 app.include_router(reports.router, prefix="/api/v1/reports", tags=["Reports"], dependencies=_auth)
-app.include_router(vouchers.router, prefix="/api/v1/vouchers", tags=["Vouchers"], dependencies=_auth)
+app.include_router(vouchers_crud_router, prefix="/api/v1/vouchers", tags=["Vouchers"], dependencies=_auth)
+app.include_router(vouchers_ai_router, prefix="/api/v1/vouchers", tags=["Vouchers"], dependencies=_auth)
+app.include_router(reconciliation_router, prefix="/api/v1/vouchers", tags=["Vouchers"], dependencies=_auth)
+app.include_router(vouchers_upload_router, prefix="/api/v1/vouchers", tags=["Vouchers"], dependencies=_auth)
 app.include_router(closing.router, prefix="/api/v1/closing", tags=["Closing"], dependencies=_auth)
 app.include_router(accounts.router, prefix="/api/v1/accounts", tags=["Accounts"], dependencies=_auth)
 app.include_router(system.router, prefix="/api/v1/system", tags=["System"], dependencies=_auth)
@@ -247,15 +270,55 @@ app.include_router(backup_router.router, prefix="/api/v1/system", tags=["Backup"
 
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
+    """Composite health check for load balancer / orchestrator probes.
+
+    Reports DB and Redis status separately so the LB can make informed
+    routing decisions. A node with a dead DB is fully degraded (503);
+    a node with a dead Redis is partially degraded (200 with degraded=true)
+    since the rate limiter falls back to in-memory mode, so the node can
+    still serve requests but should not be preferred over healthy nodes.
+    """
+    components: dict[str, str] = {}
+    overall_ok = True
+
+    # 1. Database — hard dependency. If DB is down, return 503.
     try:
         from app.database import _is_postgres
         if _is_postgres:
             db.execute(text("SET LOCAL statement_timeout = '2s'"))
         db.execute(text("SELECT 1"))
-        return {"status": "ok", "message": "Backend is running smoothly.", "db": "connected"}
+        components["db"] = "ok"
     except Exception as e:
-        logger.error("Health check failed: %s", e)
-        return JSONResponse(status_code=503, content={"status": "error", "message": "Database unavailable"})
+        logger.error("Health check DB failed: %s", e)
+        components["db"] = "error"
+        overall_ok = False
+
+    # 2. Redis — soft dependency in dev (rate limiter falls back to in-memory),
+    # hard in production (without Redis, rate limiting is per-process and can
+    # be trivially bypassed by spreading requests across workers). We still
+    # report 200 if only Redis is down, but mark degraded=true so the LB can
+    # deprioritize this node.
+    redis_ok = True
+    try:
+        from app.rate_limit import _check_redis_health
+        redis_ok = _check_redis_health()
+        components["redis"] = "ok" if redis_ok else "error"
+    except Exception as e:
+        logger.warning("Health check Redis probe failed: %s", e)
+        components["redis"] = "error"
+        redis_ok = False
+
+    degraded = overall_ok and not redis_ok
+    if not overall_ok:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "components": components},
+        )
+    return {
+        "status": "degraded" if degraded else "ok",
+        "components": components,
+        "degraded": degraded,
+    }
 
 
 if __name__ == "__main__":

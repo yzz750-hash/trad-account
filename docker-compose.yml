@@ -1,4 +1,4 @@
-﻿version: "3.9"
+version: "3.9"
 
 services:
   db:
@@ -34,22 +34,44 @@ services:
       timeout: 5s
       retries: 5
 
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8004}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - backend
+
   backend:
     build: ./backend
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PORT:-8004}:8000"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://traduser:tradpass@db:5432/tradaccount}
-      JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
-      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      # DATABASE_URL must be supplied via .env. The default value below is an
+      # intentionally invalid placeholder so a misconfigured deployment fails
+      # loudly at startup instead of silently creating an empty database with
+      # a mismatched password. The db service reads its password from the
+      # postgres_password secret; this URL must use the SAME password.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env and match the postgres_password secret}
+      ENVIRONMENT: production
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
-      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-sk-placeholder}
       REDIS_URL: redis://redis:6379/0
+      # Default passwords are intentionally invalid placeholders so the
+      # deployment refuses to start until strong passwords are configured
+      # in .env. The previous defaults (admin123, accountant1, auditor123)
+      # were weak and present in version control — a security risk.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set in .env}
+      ACCOUNTANT_PASSWORD: ${ACCOUNTANT_PASSWORD:?ACCOUNTANT_PASSWORD must be set in .env}
+      AUDITOR_PASSWORD: ${AUDITOR_PASSWORD:?AUDITOR_PASSWORD must be set in .env}
     secrets:
-      - jwt_secret_key
-      - encryption_key
-      - deepseek_api_key
+      - postgres_password
     depends_on:
       db:
         condition: service_healthy
@@ -64,12 +86,6 @@ services:
           cpus: "1.0"
 
 secrets:
-  jwt_secret_key:
-    file: ./secrets/jwt_secret_key.txt
-  encryption_key:
-    file: ./secrets/encryption_key.txt
-  deepseek_api_key:
-    file: ./secrets/deepseek_api_key.txt
   postgres_password:
     file: ./secrets/postgres_password.txt
 

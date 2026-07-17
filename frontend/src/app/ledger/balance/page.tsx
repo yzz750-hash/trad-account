@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { apiFetch, errMsg } from "@/lib/api";
 import { useLedger } from "@/context/LedgerContext";
+import { d, sum } from "@/lib/decimal";
 
 interface BalanceRow {
   account_id: number;
@@ -33,6 +34,7 @@ export default function AccountBalancePage() {
       const params = new URLSearchParams();
       params.set("year", String(year));
       if (month) params.set("month", month);
+      params.set("level", "1");
       const data = await apiFetch<BalanceRow[]>(
         `/api/v1/reports/account-balances?${params.toString()}`
       );
@@ -50,12 +52,12 @@ export default function AccountBalancePage() {
   }, [year, month]);
 
   // Compute totals
-  const totalOpenDebit = rows.reduce((s, r) => s + parseFloat(r.opening_debit || "0"), 0);
-  const totalOpenCredit = rows.reduce((s, r) => s + parseFloat(r.opening_credit || "0"), 0);
-  const totalPeriodDebit = rows.reduce((s, r) => s + parseFloat(r.period_debit || "0"), 0);
-  const totalPeriodCredit = rows.reduce((s, r) => s + parseFloat(r.period_credit || "0"), 0);
-  const totalEndDebit = rows.reduce((s, r) => s + parseFloat(r.ending_debit || "0"), 0);
-  const totalEndCredit = rows.reduce((s, r) => s + parseFloat(r.ending_credit || "0"), 0);
+  const totalOpenDebit = sum(rows.map(r => r.opening_debit || "0"));
+  const totalOpenCredit = sum(rows.map(r => r.opening_credit || "0"));
+  const totalPeriodDebit = sum(rows.map(r => r.period_debit || "0"));
+  const totalPeriodCredit = sum(rows.map(r => r.period_credit || "0"));
+  const totalEndDebit = sum(rows.map(r => r.ending_debit || "0"));
+  const totalEndCredit = sum(rows.map(r => r.ending_credit || "0"));
 
   const exportCSV = () => {
     const BOM = "﻿";
@@ -184,12 +186,12 @@ export default function AccountBalancePage() {
                       <td className="py-2 px-4 font-mono text-slate-600">{r.account_code}</td>
                       <td className="py-2 px-4 text-slate-700">{r.account_name}</td>
                       <td className={`py-2 px-4 text-center text-xs font-medium ${r.balance_direction === "借" ? "text-indigo-600" : "text-orange-600"}`}>{r.balance_direction}</td>
-                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.opening_debit !== "0" ? parseFloat(r.opening_debit).toFixed(2) : ""}</td>
-                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.opening_credit !== "0" ? parseFloat(r.opening_credit).toFixed(2) : ""}</td>
-                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.period_debit !== "0" ? parseFloat(r.period_debit).toFixed(2) : ""}</td>
-                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.period_credit !== "0" ? parseFloat(r.period_credit).toFixed(2) : ""}</td>
-                      <td className="py-2 px-4 text-right font-mono font-medium text-slate-700">{r.ending_debit !== "0" ? parseFloat(r.ending_debit).toFixed(2) : ""}</td>
-                      <td className="py-2 px-4 text-right font-mono font-medium text-slate-700">{r.ending_credit !== "0" ? parseFloat(r.ending_credit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.opening_debit !== "0" ? d(r.opening_debit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.opening_credit !== "0" ? d(r.opening_credit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.period_debit !== "0" ? d(r.period_debit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono text-slate-600">{r.period_credit !== "0" ? d(r.period_credit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono font-medium text-slate-700">{r.ending_debit !== "0" ? d(r.ending_debit).toFixed(2) : ""}</td>
+                      <td className="py-2 px-4 text-right font-mono font-medium text-slate-700">{r.ending_credit !== "0" ? d(r.ending_credit).toFixed(2) : ""}</td>
                     </tr>
                   ))
                 )}
@@ -198,12 +200,12 @@ export default function AccountBalancePage() {
                 <tfoot className="bg-slate-50 border-t-2 border-slate-300 text-sm font-bold text-slate-700">
                   <tr>
                     <td colSpan={3} className="py-3 px-4 text-right">合计</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalOpenDebit ? totalOpenDebit.toFixed(2) : ""}</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalOpenCredit ? totalOpenCredit.toFixed(2) : ""}</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalPeriodDebit.toFixed(2)}</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalPeriodCredit.toFixed(2)}</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalEndDebit ? totalEndDebit.toFixed(2) : ""}</td>
-                    <td className="py-3 px-4 text-right font-mono">{totalEndCredit ? totalEndCredit.toFixed(2) : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalOpenDebit).gt(0) ? totalOpenDebit : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalOpenCredit).gt(0) ? totalOpenCredit : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalPeriodDebit).gt(0) ? totalPeriodDebit : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalPeriodCredit).gt(0) ? totalPeriodCredit : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalEndDebit).gt(0) ? totalEndDebit : ""}</td>
+                    <td className="py-3 px-4 text-right font-mono">{d(totalEndCredit).gt(0) ? totalEndCredit : ""}</td>
                   </tr>
                 </tfoot>
               )}

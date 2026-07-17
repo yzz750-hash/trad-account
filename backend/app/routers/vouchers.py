@@ -12,16 +12,16 @@ All external imports (closing.py, ai_chat.py) continue to work via re-exports be
 
 from fastapi import APIRouter
 
-from app.routers.vouchers_crud import router as _crud_router
-from app.routers.vouchers_ai import router as _ai_router
-from app.routers.reconciliation import router as _recon_router
-from app.routers.vouchers_upload import router as _upload_router
+from app.routers.vouchers_crud import router as _crud_router  # noqa: F401
+from app.routers.vouchers_ai import router as _ai_router  # noqa: F401
+from app.routers.reconciliation import router as _recon_router  # noqa: F401
+from app.routers.vouchers_upload import router as _upload_router  # noqa: F401
 
+# Routes are registered directly in main.py (with prefix="/api/v1/vouchers")
+# to avoid FastAPIError "Prefix and path cannot be both empty" that occurs
+# when include_router has no prefix and the sub-router uses "" as the path.
+# This module now exists only as a compatibility layer for re-exports.
 router = APIRouter()
-router.include_router(_crud_router)
-router.include_router(_ai_router)
-router.include_router(_recon_router)
-router.include_router(_upload_router)
 
 # Re-exports for backward compatibility (used by closing.py and ai_chat.py)
 from app.routers.voucher_utils import (  # noqa: F401, E402

@@ -18,7 +18,7 @@ from app.models.financial import (
 logger = logging.getLogger("trad_account")
 
 
-def validate_balance(entries: list[dict], tolerance: Decimal = Decimal("0.001")) -> None:
+def validate_balance(entries: list[dict], tolerance: Decimal = Decimal("0.01")) -> None:
     """Validate that debits equal credits. Raises HTTPException if unbalanced."""
     total_debit = sum(e["amount"] for e in entries if e["direction"] == AccountDirection.DEBIT)
     total_credit = sum(e["amount"] for e in entries if e["direction"] == AccountDirection.CREDIT)

@@ -33,14 +33,15 @@ class AccountCreate(BaseModel):
 class AccountUpdate(BaseModel):
     name: str | None = None
     opening_balance: Money | None = None
+    code: str | None = None
 
-@router.get("/", response_model=List[AccountSchema])
+@router.get("", response_model=List[AccountSchema])
 def list_accounts(db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id)):
     """Get all chart of accounts."""
     accounts = db.query(Account).filter(Account.ledger_id == ledger_id).order_by(Account.code).all()
     return [AccountSchema.model_validate(a) for a in accounts]
 
-@router.post("/", response_model=AccountSchema)
+@router.post("", response_model=AccountSchema)
 def create_account(account: AccountCreate, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), _: None = Depends(require_write)):
     """Add a new account, typically a sub-account."""
     from app.models.financial import AccountType, AccountDirection
@@ -94,19 +95,39 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db), ledger
 
 @router.put("/{account_id}", response_model=AccountSchema)
 def update_account(account_id: int, account_data: AccountUpdate, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id), _: None = Depends(require_write)):
-    """Update account name or opening balance."""
+    """Update account name, code, or opening balance."""
     acc = db.query(Account).filter(Account.ledger_id == ledger_id, Account.id == account_id).first()
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found.")
-        
+
+    if account_data.code is not None:
+        # Only sub-accounts can change code
+        if acc.parent_id is None:
+            raise HTTPException(status_code=400, detail="一级科目编码不可修改。")
+        import re
+        if not re.match(r'^\d{4,12}$', account_data.code):
+            raise HTTPException(status_code=400, detail="Account code must be 4-12 digits.")
+        # Must start with parent code
+        parent = db.query(Account).filter(Account.id == acc.parent_id, Account.ledger_id == ledger_id).first()
+        if parent and not account_data.code.startswith(parent.code):
+            raise HTTPException(status_code=400, detail=f"编码必须以上级科目编码 '{parent.code}' 开头。")
+        existing = db.query(Account).filter(
+            Account.ledger_id == ledger_id,
+            Account.code == account_data.code,
+            Account.id != account_id,
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="科目编码已存在。")
+        acc.code = account_data.code
+
     if account_data.name is not None:
         acc.name = account_data.name
     if account_data.opening_balance is not None:
         acc.opening_balance = account_data.opening_balance
-        
+
     db.commit()
     db.refresh(acc)
-    
+
     return AccountSchema.model_validate(acc)
 
 @router.get("/trial-balance")

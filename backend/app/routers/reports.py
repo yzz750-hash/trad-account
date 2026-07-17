@@ -1,9 +1,10 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, case, or_, extract
 from typing import List, Optional
 from datetime import date
 from decimal import Decimal
+import calendar as _cal
 from pydantic import BaseModel
 from app.types import Money
 
@@ -520,6 +521,12 @@ class BalanceSheetResponse(BaseModel):
     total_assets: Money
     total_liabilities: Money
     total_equity: Money
+    # Accounting identity check: 资产 = 负债 + 权益. Exposing this lets the
+    # frontend surface imbalances instead of silently presenting a wrong sheet.
+    # A non-zero discrepancy indicates either unbalanced vouchers, a data
+    # integrity bug, or equity plug entries that haven't been reconciled.
+    is_balanced: bool
+    balance_discrepancy: Money
 
 @router.get("/balance-sheet", response_model=BalanceSheetResponse)
 def get_balance_sheet(as_of_date: date, db: Session = Depends(get_db), ledger_id: int = Depends(get_ledger_id)):
@@ -589,13 +596,28 @@ def get_balance_sheet(as_of_date: date, db: Session = Depends(get_db), ledger_id
     total_liabilities = sum(l.amount for l in liabilities)
     total_equity = sum(e.amount for e in equity)
     
+    # 会计恒等式校验: 资产 = 负债 + 权益
+    # 允许 0.01 的舍入容差（Money 精度）。差异大于容差说明账务数据有问题，
+    # 必须显式暴露给调用方，不能让前端展示一张"看起来对"但其实不平的报表。
+    liability_plus_equity = total_liabilities + total_equity
+    discrepancy = total_assets - liability_plus_equity
+    is_balanced = abs(discrepancy) <= Decimal("0.01")
+    if not is_balanced:
+        logger = __import__("logging").getLogger("trad_account")
+        logger.warning(
+            "Balance sheet imbalance for ledger=%s as_of=%s: assets=%s vs (liabilities+equity)=%s, diff=%s",
+            ledger_id, as_of_date, total_assets, liability_plus_equity, discrepancy,
+        )
+    
     return BalanceSheetResponse(
         assets=assets,
         liabilities=liabilities,
         equity=equity,
         total_assets=total_assets,
         total_liabilities=total_liabilities,
-        total_equity=total_equity
+        total_equity=total_equity,
+        is_balanced=is_balanced,
+        balance_discrepancy=discrepancy,
     )
 
 class IncomeStatementItem(BaseModel):
@@ -1254,11 +1276,14 @@ def get_dashboard_summary(
         for aid in revenue_ids
     )
 
-    monthly_revenue_trend = (
-        ((monthly_revenue - prev_revenue) / prev_revenue * 100)
-        if prev_revenue != 0
-        else None
-    )
+    # 收入趋势：避免负数基数导致趋势方向反转
+    if prev_revenue > 0:
+        monthly_revenue_trend = (monthly_revenue - prev_revenue) / prev_revenue * 100
+    elif prev_revenue < 0:
+        # 上月为负（如退货），本月转正视为 100% 增长，仍为负视为 -100%
+        monthly_revenue_trend = Decimal("100") if monthly_revenue > 0 else Decimal("-100")
+    else:
+        monthly_revenue_trend = None
 
     # 2. Pending prepayments: sum of 预付账款 (1123) account balances
     prepay_accounts = (
@@ -1454,6 +1479,9 @@ def _compute_opening_for_period(
         cutoff_month = 12
 
     # Include everything from opening through the cutoff
+    # 使用月末最后一天，避免漏算 29-31 号凭证
+    _, _cutoff_last_day = _cal.monthrange(cutoff_year, cutoff_month)
+    _cutoff_date_str = f"{cutoff_year}-{cutoff_month:02d}-{_cutoff_last_day:02d}"
     rows = (
         db.query(
             VoucherEntry.account_id,
@@ -1466,7 +1494,7 @@ def _compute_opening_for_period(
             VoucherEntry.account_id.in_(account_ids),
             Voucher.status == VoucherStatus.POSTED,
             func.date(Voucher.voucher_date)
-            <= func.date(f"{cutoff_year}-{cutoff_month:02d}-28"),
+            <= func.date(_cutoff_date_str),
         )
         .group_by(VoucherEntry.account_id)
         .all()
@@ -1482,74 +1510,114 @@ def _compute_opening_for_period(
 def get_account_balances(
     year: int = Query(...),
     month: int | None = Query(None, ge=1, le=12),
+    level: int | None = Query(None, ge=1, le=3, description="科目级别：1=一级(4位), 2=二级(6位), 3=三级(8位)"),
     db: Session = Depends(get_db),
     ledger_id: int = Depends(get_ledger_id),
 ):
-    """科目余额表：按年月查询各科目的期初、本期发生、期末余额。"""
-    accounts = (
+    """科目余额表：按年月查询各科目的期初、本期发生、期末余额。
+    当指定level时，下级科目余额汇入上级后只展示该级科目。
+    """
+    from sqlalchemy import func as safunc
+    all_accounts = (
         db.query(Account)
         .filter(Account.ledger_id == ledger_id, Account.is_active == True)
         .order_by(Account.code)
         .all()
     )
 
-    if not accounts:
+    if not all_accounts:
         return []
 
-    account_ids = [a.id for a in accounts]
+    all_ids = [a.id for a in all_accounts]
 
-    # Opening balances
-    opening_map = _compute_opening_for_period(db, ledger_id, year, month, account_ids)
+    # Build parent map: child_id → parent_id
+    parent_map: dict[int, int] = {}
+    for a in all_accounts:
+        if a.parent_id is not None:
+            parent_map[a.id] = a.parent_id
 
-    # Period activity
+    # Compute balances for ALL accounts
+    opening_map = _compute_opening_for_period(db, ledger_id, year, month, all_ids)
+
     if month is not None:
-        period_map = _try_fast_period_balances(db, ledger_id, year, month, account_ids)
+        period_map = _try_fast_period_balances(db, ledger_id, year, month, all_ids)
         if period_map is None:
-            period_map = _compute_period_from_vouchers(db, ledger_id, year, month, account_ids)
+            period_map = _compute_period_from_vouchers(db, ledger_id, year, month, all_ids)
     else:
-        # YTD: aggregate all months
         period_map = {}
         for m in range(1, 13):
-            mp = _try_fast_period_balances(db, ledger_id, year, m, account_ids)
+            mp = _try_fast_period_balances(db, ledger_id, year, m, all_ids)
             if mp is None:
-                mp = _compute_period_from_vouchers(db, ledger_id, year, m, account_ids)
+                mp = _compute_period_from_vouchers(db, ledger_id, year, m, all_ids)
             for aid, (d, c) in mp.items():
                 pd, pc = period_map.get(aid, (Decimal("0"), Decimal("0")))
                 period_map[aid] = (pd + d, pc + c)
 
-    rows = []
-    for a in accounts:
-        # Opening (from previous period's ending)
+    # Build row dict for all accounts
+    row_by_id: dict[int, dict] = {}
+    for a in all_accounts:
         open_d, open_c = opening_map.get(a.id, (Decimal("0"), Decimal("0")))
-        # Plus account's own opening_balance
         own_open = Decimal(str(a.opening_balance or 0))
         if a.balance_direction == AccountDirection.DEBIT:
             open_d += own_open
         else:
             open_c += own_open
 
-        # Period
         p_d, p_c = period_map.get(a.id, (Decimal("0"), Decimal("0")))
 
-        # Ending
+        row_by_id[a.id] = {
+            "account": a,
+            "open_d": open_d,
+            "open_c": open_c,
+            "period_d": p_d,
+            "period_c": p_c,
+        }
+
+    # Roll up: deepest first — add child balances to parent
+    if level is not None:
+        sorted_accounts = sorted(all_accounts, key=lambda x: len(x.code), reverse=True)
+        for a in sorted_accounts:
+            if a.id in parent_map:
+                parent_id = parent_map[a.id]
+                if parent_id in row_by_id:
+                    child_row = row_by_id[a.id]
+                    parent_row = row_by_id[parent_id]
+                    parent_row["open_d"] += child_row["open_d"]
+                    parent_row["open_c"] += child_row["open_c"]
+                    parent_row["period_d"] += child_row["period_d"]
+                    parent_row["period_c"] += child_row["period_c"]
+
+    # Build output rows, filtered by level
+    code_len = level * 2 + 2 if level is not None else None
+    rows = []
+    for a in all_accounts:
+        if code_len is not None and len(a.code) != code_len:
+            continue
+
+        r = row_by_id[a.id]
+        open_d = r["open_d"]
+        open_c = r["open_c"]
+        p_d = r["period_d"]
+        p_c = r["period_c"]
+
         end_d = open_d + p_d
         end_c = open_c + p_c
 
-        # Net them — only one side should be non-zero for ending
-        if end_d >= end_c:
-            end_d = end_d - end_c
-            end_c = Decimal("0")
-        else:
-            end_c = end_c - end_d
-            end_d = Decimal("0")
-
-        # Same for opening
+        # Net opening
         if open_d >= open_c:
             open_d = open_d - open_c
             open_c = Decimal("0")
         else:
             open_c = open_c - open_d
             open_d = Decimal("0")
+
+        # Net ending
+        if end_d >= end_c:
+            end_d = end_d - end_c
+            end_c = Decimal("0")
+        else:
+            end_c = end_c - end_d
+            end_d = Decimal("0")
 
         rows.append(AccountBalanceRow(
             account_id=a.id,

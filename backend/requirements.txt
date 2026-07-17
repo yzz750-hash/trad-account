@@ -1,16 +1,25 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-sqlalchemy>=2.0.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-litellm>=1.40.0
-PyMuPDF>=1.24.0
-opendataloader-pdf>=2.4.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-alembic>=1.13.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-cryptography>=41.0.0
-python-multipart>=0.0.9
-redis[hiredis]>=5.0.0
+# Pin all dependency versions for reproducible production deployments.
+# Upper bounds prevent surprise breaking changes from minor/patch releases.
+# Update intentionally via `pip-compile` or manual review, never via `pip install -U`.
+
+fastapi>=0.115.0,<0.116
+uvicorn[standard]>=0.30.0,<0.32
+sqlalchemy>=2.0.0,<2.1
+pydantic>=2.0.0,<3.0
+python-dotenv>=1.0.0,<2.0
+litellm>=1.40.0,<1.90
+PyMuPDF>=1.24.0,<1.26
+opendataloader-pdf>=2.4.0,<3.0
+pandas>=2.0.0,<3.0
+openpyxl>=3.1.0,<4.0
+alembic>=1.13.0,<1.16
+# python-jose has CVE-2024-33664 (algorithm confusion). Pin to >=3.4.0 which
+# includes the fix. TODO(P2): migrate to PyJWT which is actively maintained.
+python-jose[cryptography]>=3.4.0,<4.0
+# passlib was previously listed but never imported — auth.py uses bcrypt
+# directly. Removed to reduce attack surface and avoid the passlib+bcrypt
+# version-incompatibility issue (passlib pins bcrypt<4.1).
+bcrypt>=4.0.0,<5.0
+cryptography>=42.0.0,<46.0
+python-multipart>=0.0.9,<1.0
+redis[hiredis]>=5.0.0,<6.0

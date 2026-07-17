@@ -53,6 +53,12 @@ def cleanup_old_audit_logs() -> int:
     try:
         db = SessionLocal()
         try:
+            # Check table existence first — on a fresh install migrations may not have
+            # created audit_logs yet. Silence the noise instead of WARNING every boot.
+            from sqlalchemy import inspect as _inspect
+            if not _inspect(db.bind).has_table(AuditLog.__tablename__):
+                logger.debug("Audit log cleanup skipped: table '%s' does not exist yet.", AuditLog.__tablename__)
+                return 0
             deleted = db.query(AuditLog).filter(AuditLog.created_at < cutoff).delete()
             db.commit()
             if deleted:
@@ -69,10 +75,20 @@ def cleanup_old_audit_logs() -> int:
 
 
 def schedule_audit_cleanup():
-    """Schedule a one-time background cleanup of old audit logs."""
-    if __import__("os").environ.get("ENVIRONMENT") == "ci" or __import__("os").environ.get("PYTEST_CURRENT_TEST"):
+    """Schedule a one-time background cleanup of old audit logs.
+
+    A short delay is added so that on a cold start the Alembic migrations have
+    a chance to create the audit_logs table before we try to clean it.
+    """
+    import os as _os
+    if _os.environ.get("ENVIRONMENT") == "ci" or _os.environ.get("PYTEST_CURRENT_TEST"):
         return
-    _cleanup_executor.submit(cleanup_old_audit_logs)
+
+    def _deferred():
+        time.sleep(3)
+        cleanup_old_audit_logs()
+
+    _cleanup_executor.submit(_deferred)
 
 
 def _extract_identity(request: Request) -> str | None:

@@ -31,6 +31,9 @@ from app.models.financial import (
 
 D = Decimal
 
+# source_type 标记期末调汇凭证，便于后续 runs 排除调汇基线
+FX_REVALUATION_SOURCE_TYPE = "FX_REVALUATION"
+
 
 def check_no_draft_vouchers(db: Session, ledger_id: int, year: int, month: int) -> None:
     """Block period-end operations if any DRAFT vouchers exist for the period."""
@@ -146,10 +149,10 @@ def compute_period_balances(db: Session, ledger_id: int, year: int, month: int) 
 
 def calculate_depreciation(
     db: Session, ledger_id: int, year: int, month: int
-) -> tuple[Decimal, list[tuple[FixedAsset, Decimal]]]:
+) -> tuple[Decimal, list[tuple[FixedAsset, Decimal]], bool]:
     """Calculate straight-line depreciation for all active fixed assets.
 
-    Returns (total_depreciation, [(asset, monthly_amount), ...]).
+    Returns (total_depreciation, [(asset, monthly_amount), ...], had_any_assets).
     CAS: depreciation starts the month AFTER purchase.
     """
     period_start = date(year, month, 1)
@@ -308,7 +311,9 @@ def calculate_profit_loss_carry_forward(
     if not pl_accounts:
         return [], D("0")
 
-    voucher_date = date(year, month, 28)
+    # 月末最后一天作为截止日，确保 29-31 号的凭证不被漏算
+    _, _last_day = _cal.monthrange(year, month)
+    voucher_date = date(year, month, _last_day)
     pl_ids = [a.id for a in pl_accounts]
 
     balance_map = defaultdict(lambda: defaultdict(lambda: D("0")))

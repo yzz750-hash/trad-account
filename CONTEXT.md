@@ -21,3 +21,10 @@
 您可以手动在系统命令行（如 CMD、PowerShell 或 VS Code 终端）分别运行以下命令启动服务，以防 IDE 内置终端因监听刷新而引起崩溃：
 - **后端**：在 `backend` 目录下运行 `venv\Scripts\python -m app.main`
 - **前端**：在 `frontend` 目录下运行 `npm run dev`
+
+## 4. 架构与产品评估建议 (Expert Reviews)
+在近期的专家模拟评审中（包括CTO、CPO、CEO及行业大牛视角），梳理出以下高优先级改进方向：
+1. **全栈工程化修复**：去除 `backend/app/main.py` 中的 `sys.path.insert` 坏味道，规范 Python 模块导入逻辑；建议在前端报表等重数据页面利用 Next.js RSC（服务端渲染）性能。
+2. **安全与财务严谨度**：需在 ORM 层实现凭证“审核记账后不可更改/删除”的强拦截逻辑，确保财务数据防篡改性。
+3. **AI 识别闭环 (Human-in-the-loop)**：在前端 `AIChat.tsx` 增加发票 OCR 结果的置信度展示与用户确认、纠错机制。
+4. **环境一致性与并发**：开发环境建议从 SQLite 迁移到 PostgreSQL（可使用 Docker），避免事务隔离与并发写锁隐患。

@@ -22,6 +22,9 @@ export default function SettingsLayout({
           <Link href="/settings/currencies" className="px-3 py-2 rounded-md hover:bg-slate-100 transition-colors">
             汇率管理
           </Link>
+          <Link href="/settings/backup" className="px-3 py-2 rounded-md hover:bg-slate-100 transition-colors">
+            数据备份
+          </Link>
         </nav>
       </div>
       <div className="flex-1 bg-[#F8F9FA]">

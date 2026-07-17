@@ -22,7 +22,7 @@ const taskColors: Record<string, string> = {
 };
 
 export default function Home() {
-  const { currentLedgerId, currentLedger } = useLedger();
+  const { currentLedgerId, currentLedger, ledgers, ledgersLoaded } = useLedger();
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -55,6 +55,12 @@ export default function Home() {
           <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl p-4 mb-6 text-sm">
             {error}
             <button onClick={() => { setError(null); setLoading(true); apiFetch<DashboardSummary>("/api/v1/reports/dashboard-summary").then(setSummary).catch(() => setError("加载失败，请重试")).finally(() => setLoading(false)); }} className="ml-3 underline font-medium hover:text-rose-800">重试</button>
+          </div>
+        )}
+        {ledgersLoaded && ledgers.length === 0 && (
+          <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-6 mb-6">
+            <h3 className="font-semibold mb-1">尚未创建任何账套</h3>
+            <p className="text-sm text-amber-700 mb-3">系统需要一个账套才能展示财务数据。请联系管理员在「设置」中创建首个账套，或运行 <code className="bg-amber-100 px-1.5 py-0.5 rounded text-xs">python init_db.py</code> 初始化示例账套。</p>
           </div>
         )}
         {loading ? (
