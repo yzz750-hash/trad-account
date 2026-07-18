@@ -57,6 +57,9 @@ export default function VoucherList() {
   };
 
   const fetchVouchers = async () => {
+    // Wait until LedgerProvider has selected a ledger; otherwise apiFetch omits
+    // the X-Ledger-Id header and the backend rejects with 400.
+    if (!currentLedgerId) return;
     setLoading(true);
     try {
       const params = new URLSearchParams();
@@ -121,6 +124,8 @@ export default function VoucherList() {
   };
 
   useEffect(() => {
+    // Don't fire until ledger is selected (otherwise X-Ledger-Id header missing)
+    if (!currentLedgerId) return;
     fetchPartnersAndCurrencies();
     fetchExchangeRates();
     fetchAccounts();

@@ -78,12 +78,19 @@ app = FastAPI(
     description="API for the China foreign trade financial software with Agnostic LLM and Multi-ledger.",
     version="1.0.0",
     default_response_class=DecimalAwareJSONResponse,
-    # Disable automatic slash redirection. When the Next.js dev server proxies
-    # /api/* requests via rewrites, a 307 redirect makes the proxy follow
-    # server-side WITHOUT forwarding the browser's cookies → 401. With this
-    # disabled, routes must match the exact path (collection routes use "" so
-    # they live at /api/v1/foo, not /api/v1/foo/).
-    redirect_slashes=False,
+    # Re-enabled automatic slash redirection. Previously disabled (redirect_slashes=False)
+    # to work around a Next.js dev-proxy cookie-drop issue: when the backend returned
+    # 307 from /api/v1/foo → /api/v1/foo/, the dev server followed the redirect
+    # server-side without re-attaching the browser's Cookie header → 401.
+    #
+    # This workaround regressed 58+ tests (and some frontend calls) that use
+    # trailing-slash URLs against collection routes registered as "" — they 404'd.
+    # Modern Next.js rewrites (13+/16) preserve headers across the proxy hop,
+    # and the regression cost (broken tests + UX bugs) outweighs the dev-proxy
+    # edge case. If the 401 resurfaces in dev, the proper fix is to align the
+    # frontend URL convention (drop trailing slash everywhere) rather than
+    # globally disable FastAPI's slash normalization.
+    redirect_slashes=True,
 )
 
 app.add_middleware(

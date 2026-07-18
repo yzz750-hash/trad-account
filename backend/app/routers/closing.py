@@ -40,6 +40,8 @@ from app.services.closing import (
     calculate_depreciation,
     calculate_fx_revaluation,
     calculate_profit_loss_carry_forward,
+    PNL_CARRY_FORWARD_SOURCE_TYPE,
+    YEAR_END_CARRY_FORWARD_SOURCE_TYPE,
 )
 
 
@@ -132,6 +134,7 @@ def carry_forward_profit_loss(year: int, month: int, db: Session = Depends(get_d
     v = Voucher(ledger_id=ledger_id, voucher_number=get_next_voucher_number(db, ledger_id),
         voucher_date=voucher_date,
         status=VoucherStatus.DRAFT,
+        source_type=PNL_CARRY_FORWARD_SOURCE_TYPE,
     )
     db.add(v)
     db.flush()
@@ -163,7 +166,14 @@ def carry_forward_profit_loss(year: int, month: int, db: Session = Depends(get_d
         db.rollback()
         logger.exception("Failed to carry forward profit/loss for ledger %s, period %s-%s", ledger_id, year, month)
         raise HTTPException(status_code=500, detail="Failed to carry forward profit/loss.")
-    return {"status": "success", "message": f"P&L carry-forward completed. Net profit impact: {total_profit_impact:.2f}"}
+    return {
+        "status": "success",
+        "message": f"P&L carry-forward completed. Net profit impact: {total_profit_impact:.2f}",
+        "voucher_id": v.id,
+        "voucher_status": v.status.value,
+        "net_profit_impact": float(total_profit_impact),
+        "note": "Voucher is created in DRAFT status. POST it via /api/v1/vouchers/{id}/post to finalize the carry-forward before period close.",
+    }
 
 
 @router.post("/year-end")
@@ -225,6 +235,7 @@ def carry_forward_year_end(year: int, db: Session = Depends(get_db), ledger_id: 
         voucher_number=get_next_voucher_number(db, ledger_id),
         voucher_date=date(year, 12, 31),
         status=VoucherStatus.DRAFT,
+        source_type=YEAR_END_CARRY_FORWARD_SOURCE_TYPE,
     )
     db.add(v)
     db.flush()
@@ -268,7 +279,14 @@ def carry_forward_year_end(year: int, db: Session = Depends(get_db), ledger_id: 
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to carry forward year-end profit/loss.")
 
-    return {"status": "success", "message": f"Year-end carry-forward completed. Net profit/loss: {net_profit:.2f} transferred to Retained Earnings."}
+    return {
+        "status": "success",
+        "message": f"Year-end carry-forward completed. Net profit/loss: {net_profit:.2f} transferred to Retained Earnings. [BUGFIX-v2]",
+        "voucher_id": v.id,
+        "voucher_status": v.status.value,
+        "net_profit": float(net_profit),
+        "note": "Voucher is created in DRAFT status. POST it via /api/v1/vouchers/{id}/post to finalize the year-end carry-forward.",
+    }
 
 
 @router.post("/fx-revaluation")

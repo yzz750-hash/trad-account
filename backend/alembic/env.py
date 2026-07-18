@@ -6,7 +6,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
+from dotenv import load_dotenv
 from app.database import Base
+
+# Load .env so alembic CLI picks up DATABASE_URL/JWT_SECRET_KEY/etc.
+# main.py loads the same file via load_dotenv(override=True); we mirror that
+# here so `alembic upgrade head` works identically to app startup.
+# NOTE: override=False so tests that set DATABASE_URL=sqlite://... are not
+# clobbered by the .env file's production DATABASE_URL. In production, the
+# deployment environment should set DATABASE_URL directly (docker-compose,
+# systemd, etc.) rather than relying on .env to override system env.
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_BACKEND_ROOT, ".env"), override=False)
 
 config = context.config
 

@@ -133,7 +133,7 @@ class TestAlembicUpgradeHead:
 
                 with engine.connect() as conn:
                     rev = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-                    assert rev == "c9d0e1f2a3b4", f"Expected head c9d0e1f2a3b4, got {rev}"
+                    assert rev == "d1e2f3a4b5c6", f"Expected head d1e2f3a4b5c6, got {rev}"
             finally:
                 engine.dispose()
         finally:
@@ -174,9 +174,9 @@ class TestAlembicUpgradeHead:
         script = ScriptDirectory.from_config(config)
 
         revs = list(script.walk_revisions())
-        assert len(revs) == 14, f"Expected 14 revisions, got {len(revs)}"
+        assert len(revs) == 15, f"Expected 15 revisions, got {len(revs)}"
         head = script.get_revision("head")
-        assert head.revision == "c9d0e1f2a3b4"
+        assert head.revision == "d1e2f3a4b5c6"
 
     def test_all_revisions_have_downgrade(self):
         versions_dir = MIGRATIONS_DIR / "versions"

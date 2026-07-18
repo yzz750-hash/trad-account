@@ -4,9 +4,11 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { setAuth } from '@/lib/auth';
 import { apiFetch, errMsg } from '@/lib/api';
+import { useLedger } from '@/context/LedgerContext';
 
 export default function LoginPage() {
   const router = useRouter();
+  const { resetLedger } = useLedger();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -24,6 +26,12 @@ export default function LoginPage() {
       });
 
       setAuth(data.user);
+      // Reset ledger state so LedgerProvider re-fetches ledgers after the
+      // browser navigates to /. Without this, ledgersLoaded stays true (set
+      // during the earlier 401 probe when the user was unauthenticated) and
+      // the loading gate doesn't block — pages render before setApiLedgerId
+      // runs, and apiFetch fires without X-Ledger-Id → 400.
+      resetLedger();
       router.replace('/');
     } catch (err: unknown) {
       setError(errMsg(err) || 'Network error. Please check that the backend is running.');

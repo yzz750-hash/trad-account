@@ -208,6 +208,63 @@ class TestIncomeStatement:
         assert Decimal(data["total_expense"]) == 0
         assert Decimal(data["net_income"]) == 0
 
+    def test_income_statement_after_closing_not_zero(
+        self, client, auth_headers, ledger, ledger_id, revenue_voucher, expense_voucher
+    ):
+        """Regression test: income statement must NOT zero out after P&L
+        carry-forward + period close.
+
+        Without the fix in reports.py (fast-path fallback when closing
+        vouchers exist), the fast path would use AccountBalance.period_debit/
+        credit which includes the offsetting entries of the P&L carry-forward
+        voucher — cancelling out the original revenue/expense and making the
+        income statement show 0/0/0 for a closed period.
+        """
+        headers = {**auth_headers, **{"X-Ledger-Id": str(ledger_id)}}
+
+        # 1. Run P&L carry-forward → creates DRAFT voucher with source_type=PNL_CARRY_FORWARD
+        resp_pl = client.post(
+            "/api/v1/closing/profit-loss?year=2024&month=1", headers=headers
+        )
+        assert resp_pl.status_code == 200
+        pl_voucher_id = resp_pl.json().get("voucher_id")
+        assert pl_voucher_id, "P&L carry-forward should create a voucher"
+
+        # 2. POST the P&L voucher so /closing/close accepts the period
+        resp_post = client.post(
+            f"/api/v1/vouchers/{pl_voucher_id}/post", headers=headers
+        )
+        assert resp_post.status_code == 200
+
+        # 3. Close the period — triggers compute_period_balances which writes
+        #    AccountBalance rows including the closing voucher's entries.
+        resp_close = client.post(
+            "/api/v1/closing/close?year=2024&month=1", headers=headers
+        )
+        assert resp_close.status_code == 200
+
+        # 4. Query income statement for the closed period.
+        resp = client.get(
+            "/api/v1/reports/income-statement",
+            params={"start_date": "2024-01-01", "end_date": "2024-01-31"},
+            headers={"X-Ledger-Id": str(ledger_id)},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Without fix: total_revenue=0, total_expense=0, net_income=0
+        # With fix: slow path excludes CLOSING_SOURCE_TYPES, original activity preserved
+        assert Decimal(data["total_revenue"]) == Decimal("50000"), (
+            f"Expected revenue 50000 after closing, got {data['total_revenue']} "
+            f"(fast path may have included the closing voucher's offsetting entry)"
+        )
+        assert Decimal(data["total_expense"]) == Decimal("5000"), (
+            f"Expected expense 5000 after closing, got {data['total_expense']}"
+        )
+        assert Decimal(data["net_income"]) == Decimal("45000"), (
+            f"Expected net_income 45000 after closing, got {data['net_income']}"
+        )
+
+
 
 class TestCashFlowStatement:
     def test_operating_receipt(self, client, ledger_id, revenue_voucher):

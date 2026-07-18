@@ -33,6 +33,18 @@ D = Decimal
 
 # source_type 标记期末调汇凭证，便于后续 runs 排除调汇基线
 FX_REVALUATION_SOURCE_TYPE = "FX_REVALUATION"
+# source_type 标记损益结转凭证，便于 income-statement 排除（否则结转借贷相互抵消，
+# 导致利润表归零）
+PNL_CARRY_FORWARD_SOURCE_TYPE = "PNL_CARRY_FORWARD"
+# source_type 标记年末结转凭证（4103 → 4104）
+YEAR_END_CARRY_FORWARD_SOURCE_TYPE = "YEAR_END_CARRY_FORWARD"
+
+# 所有期末结转类 source_type 集合，用于报表查询时排除
+CLOSING_SOURCE_TYPES = (
+    FX_REVALUATION_SOURCE_TYPE,
+    PNL_CARRY_FORWARD_SOURCE_TYPE,
+    YEAR_END_CARRY_FORWARD_SOURCE_TYPE,
+)
 
 
 def check_no_draft_vouchers(db: Session, ledger_id: int, year: int, month: int) -> None:

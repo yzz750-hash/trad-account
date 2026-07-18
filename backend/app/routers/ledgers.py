@@ -65,19 +65,28 @@ def create_ledger(
     db.add(period)
 
     # 3. Initialize minimal Chart of Accounts (一级科目)
+    # Codes follow the new Chinese GAAP (2014+) to align with init_db.py:
+    #   5001 = 生产成本 (COST), 6001 = 主营业务收入, 6401 = 主营业务成本
+    # Previously this used 5001/5401 for revenue/COGS which conflicted with
+    # init_db.py (where 5001=生产成本) and caused P&L carry-forward failures
+    # when vouchers referenced 6001 but the ledger only had 5001.
     default_accounts = [
         {"code": "1001", "name": "库存现金", "type": AccountType.ASSET, "dir": AccountDirection.DEBIT},
         {"code": "1002", "name": "银行存款", "type": AccountType.ASSET, "dir": AccountDirection.DEBIT},
         {"code": "1122", "name": "应收账款", "type": AccountType.ASSET, "dir": AccountDirection.DEBIT},
         {"code": "1405", "name": "库存商品", "type": AccountType.ASSET, "dir": AccountDirection.DEBIT},
+        {"code": "1601", "name": "固定资产", "type": AccountType.ASSET, "dir": AccountDirection.DEBIT},
+        {"code": "1602", "name": "累计折旧", "type": AccountType.ASSET, "dir": AccountDirection.CREDIT},
         {"code": "2202", "name": "应付账款", "type": AccountType.LIABILITY, "dir": AccountDirection.CREDIT},
         {"code": "2211", "name": "应付职工薪酬", "type": AccountType.LIABILITY, "dir": AccountDirection.CREDIT},
         {"code": "2221", "name": "应交税费", "type": AccountType.LIABILITY, "dir": AccountDirection.CREDIT},
         {"code": "4001", "name": "实收资本", "type": AccountType.EQUITY, "dir": AccountDirection.CREDIT},
         {"code": "4103", "name": "本年利润", "type": AccountType.EQUITY, "dir": AccountDirection.CREDIT},
         {"code": "4104", "name": "利润分配", "type": AccountType.EQUITY, "dir": AccountDirection.CREDIT},
-        {"code": "5001", "name": "主营业务收入", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.CREDIT},
-        {"code": "5401", "name": "主营业务成本", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},
+        {"code": "5001", "name": "生产成本", "type": AccountType.COST, "dir": AccountDirection.DEBIT},
+        {"code": "6001", "name": "主营业务收入", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.CREDIT},
+        {"code": "6401", "name": "主营业务成本", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},
+        {"code": "6403", "name": "税金及附加", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},
         {"code": "6601", "name": "销售费用", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},
         {"code": "6602", "name": "管理费用", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},
         {"code": "6603", "name": "财务费用", "type": AccountType.PROFIT_LOSS, "dir": AccountDirection.DEBIT},

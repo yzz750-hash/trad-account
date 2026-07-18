@@ -181,6 +181,12 @@ class TestYearEnd:
 
         resp_pl = client.post("/api/v1/closing/profit-loss?year=2024&month=1", headers=headers)
         assert resp_pl.status_code == 200
+        # BUG-A fix: P&L voucher is created in DRAFT status — POST it so year-end
+        # can see the 4103 balance (year-end only aggregates POSTED vouchers).
+        pl_voucher_id = resp_pl.json().get("voucher_id")
+        if pl_voucher_id:
+            resp_post = client.post(f"/api/v1/vouchers/{pl_voucher_id}/post", headers=headers)
+            assert resp_post.status_code == 200
 
         # Now do year-end
         resp = client.post("/api/v1/closing/year-end?year=2024", headers=headers)
@@ -196,6 +202,11 @@ class TestYearEnd:
         # Populate 本年利润 first
         resp_pl = client.post("/api/v1/closing/profit-loss?year=2024&month=1", headers=headers)
         assert resp_pl.status_code == 200
+        # BUG-A fix: POST the P&L voucher so year-end can see 4103 balance.
+        pl_voucher_id = resp_pl.json().get("voucher_id")
+        if pl_voucher_id:
+            resp_post = client.post(f"/api/v1/vouchers/{pl_voucher_id}/post", headers=headers)
+            assert resp_post.status_code == 200
 
         resp1 = client.post("/api/v1/closing/year-end?year=2024", headers=headers)
         assert resp1.status_code == 200

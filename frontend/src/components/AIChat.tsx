@@ -628,9 +628,10 @@ export default function AIChat() {
                       <div className="mt-3 flex gap-2">
                         <button
                           onClick={() => handleCreateSuggestedVoucher(msg.actionPayload!)}
-                          className="flex-1 bg-accent text-white text-xs py-2 rounded-lg hover:bg-accent-light transition-colors"
+                          disabled={loading}
+                          className="flex-1 bg-accent text-white text-xs py-2 rounded-lg hover:bg-accent-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                          确认创建凭证
+                          {loading ? "创建中..." : "确认创建凭证"}
                         </button>
                         <button
                           onClick={() => setInput("请帮我修改凭证")}

@@ -37,7 +37,11 @@ os.environ["ADMIN_PASSWORD"] = "admin123"
 os.environ["ACCOUNTANT_PASSWORD"] = "accountant1"
 os.environ["AUDITOR_PASSWORD"] = "auditor123"
 os.environ["ENVIRONMENT"] = "development"
-os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
+# Re-assert DATABASE_URL: main.py's load_dotenv(override=True) clobbers it with
+# .env values. In PG mode use the PG test URL; otherwise the SQLite test path.
+# Previously this line unconditionally set the SQLite path even in PG mode,
+# producing "sqlite:///None" — which silently broke PG_TEST_DATABASE_URL.
+os.environ["DATABASE_URL"] = _PG_TEST_URL if _PG_TEST_URL else f"sqlite:///{_TEST_DB_PATH}"
 from app.rate_limit import get_limiter
 from app.models.financial import (
     Ledger,
@@ -91,11 +95,14 @@ def clean_db():
     import gc as _gc
     import time as _time
 
-    os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
+    # Re-assert DATABASE_URL per-test (main.py's load_dotenv may have clobbered
+    # it). Use PG test URL if configured, otherwise the SQLite test path.
+    os.environ["DATABASE_URL"] = _PG_TEST_URL if _PG_TEST_URL else f"sqlite:///{_TEST_DB_PATH}"
     get_limiter().reset()
     _gc.collect()
     engine.dispose()
-    _time.sleep(0.15)  # ponytail: Windows needs time to release SQLite WAL file handles
+    if not _PG_TEST_URL:
+        _time.sleep(0.15)  # ponytail: Windows needs time to release SQLite WAL file handles
 
     # Retry on Windows where SQLite WAL locks can linger
     for attempt in range(5):
@@ -106,9 +113,10 @@ def clean_db():
         except Exception:
             if attempt == 4:
                 raise
-            _time.sleep(0.3 * (attempt + 1))
-            _gc.collect()
-            engine.dispose()
+            if not _PG_TEST_URL:
+                _time.sleep(0.3 * (attempt + 1))
+                _gc.collect()
+                engine.dispose()
 
     session = TestingSessionLocal()
     try:
@@ -118,7 +126,8 @@ def clean_db():
     yield
     _gc.collect()
     engine.dispose()
-    _time.sleep(0.05)
+    if not _PG_TEST_URL:
+        _time.sleep(0.05)
     try:
         Base.metadata.drop_all(bind=engine)
     except Exception:

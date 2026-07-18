@@ -577,12 +577,12 @@ def get_balance_sheet(as_of_date: date, db: Session = Depends(get_db), ledger_id
 
         debit, credit = balances.get(account.id, (Decimal("0"), Decimal("0")))
         opening = Decimal(str(account.opening_balance))
-        
+
         if account.balance_direction == AccountDirection.DEBIT:
             bal = opening + debit - credit
         else:
             bal = opening + credit - debit
-            
+
         if bal != 0:
             item = BalanceSheetItem(item_name=f"{account.code} {account.name}", amount=bal)
             if account.account_type == AccountType.ASSET:
@@ -591,6 +591,78 @@ def get_balance_sheet(as_of_date: date, db: Session = Depends(get_db), ledger_id
                 liabilities.append(item)
             elif account.account_type == AccountType.EQUITY:
                 equity.append(item)
+
+    # BUG FIX: P&L accounts (revenue/expenses) are NOT in `relevant_type`, so
+    # their balances are not part of `balances`. Under Chinese GAAP, the
+    # accounting identity 资产 = 负债 + 所有者权益 MUST hold at all times.
+    # When P&L accounts have not yet been closed into 4103 (本年利润), the
+    # net P&L balance represents current-period net income that belongs to
+    # equity. Without this adjustment, the balance sheet will show
+    # assets ≠ liabilities + equity by exactly the net income amount.
+    # Compute net P&L (cumulative up to as_of_date) and inject it into 4103
+    # if 4103's own balance doesn't already reflect it (i.e. no closing
+    # voucher has been posted yet for this period).
+    pl_accounts = [a for a in accounts if a.account_type == AccountType.PROFIT_LOSS]
+    if pl_accounts:
+        pl_ids = [a.id for a in pl_accounts]
+        pl_rows = (
+            db.query(
+                VoucherEntry.account_id,
+                func.sum(case((VoucherEntry.direction == AccountDirection.DEBIT, VoucherEntry.amount), else_=0)).label("debit_sum"),
+                func.sum(case((VoucherEntry.direction == AccountDirection.CREDIT, VoucherEntry.amount), else_=0)).label("credit_sum"),
+            )
+            .join(Voucher, VoucherEntry.voucher_id == Voucher.id)
+            .filter(
+                Voucher.ledger_id == ledger_id,
+                VoucherEntry.account_id.in_(pl_ids),
+                Voucher.voucher_date <= as_of_date,
+                Voucher.status == VoucherStatus.POSTED,
+            )
+            .group_by(VoucherEntry.account_id)
+            .all()
+        )
+        net_pl = Decimal("0")
+        pl_balance_by_account: dict[int, Decimal] = {}
+        for r in pl_rows:
+            acc = next((a for a in pl_accounts if a.id == r.account_id), None)
+            if not acc:
+                continue
+            d = Decimal(str(r.debit_sum or 0))
+            c = Decimal(str(r.credit_sum or 0))
+            # Net balance in the account's natural direction
+            if acc.balance_direction == AccountDirection.DEBIT:
+                net = d - c  # expense net (positive = net expense)
+            else:
+                net = c - d  # revenue net (positive = net revenue)
+            pl_balance_by_account[acc.id] = net
+            # Net income = revenue - expense
+            if acc.balance_direction == AccountDirection.CREDIT:
+                net_pl += net  # revenue increases net income
+            else:
+                net_pl -= net  # expense decreases net income
+
+        if net_pl != 0:
+            # Inject into 4103 (本年利润) if it exists; otherwise add as
+            # "本期未结转利润" so the identity holds.
+            profit_acc = next((a for a in accounts if a.code == "4103"), None)
+            if profit_acc:
+                # If a closing voucher has already been posted, 4103 already
+                # reflects net_pl and P&L accounts should be zero — net_pl
+                # would then be 0, so we wouldn't reach this branch. If we
+                # are here, 4103 is missing the current period's profit.
+                existing_4103 = next((e for e in equity if e.item_name.startswith("4103")), None)
+                if existing_4103:
+                    existing_4103.amount += net_pl
+                else:
+                    equity.append(BalanceSheetItem(
+                        item_name=f"{profit_acc.code} {profit_acc.name}",
+                        amount=net_pl,
+                    ))
+            else:
+                equity.append(BalanceSheetItem(
+                    item_name="本期未结转利润",
+                    amount=net_pl,
+                ))
                 
     total_assets = sum(a.amount for a in assets)
     total_liabilities = sum(l.amount for l in liabilities)
@@ -636,20 +708,51 @@ def get_income_statement(start_date: date, end_date: date, db: Session = Depends
     """
     利润表 (Income Statement) for a specific period.
     Sums P&L accounts' activity during the period.
+
+    BUG FIX: Excludes system-generated closing vouchers (P&L carry-forward,
+    year-end carry-forward, FX revaluation) so that the income statement shows
+    the TRUE business activity for the period. Without this exclusion, after
+    monthly closing the closing voucher's debit-to-revenue / credit-to-expense
+    entries would cancel out the original business entries, making the income
+    statement show zero revenue/expense.
     """
     from sqlalchemy import func
-    
+    from app.services.closing import CLOSING_SOURCE_TYPES
+
     accounts = db.query(Account).filter(Account.ledger_id == ledger_id, Account.is_active == True, Account.account_type == AccountType.PROFIT_LOSS).all()
-    
+
     revenues = []
     expenses = []
-    
+
     account_ids = [a.id for a in accounts]
     balances: dict[int, tuple[Decimal, Decimal]] = {}
-    # Fast path: single-month closed period
+    # Fast path: single-month closed period. AccountBalance.period_debit/credit
+    # is computed by compute_period_balances which sums ALL POSTED vouchers,
+    # including closing vouchers — so fast path has the same cancellation bug.
+    # Fall back to slow path (which can exclude closing vouchers) when we detect
+    # that closing vouchers exist for the period.
     fast = None
     if account_ids and start_date.year == end_date.year and start_date.month == end_date.month:
         fast = _try_fast_period_balances(db, ledger_id, start_date.year, start_date.month, account_ids)
+        if fast is not None:
+            # Detect closing vouchers for this period: if any exist, the fast
+            # path balances include their offsetting entries (revenue debited /
+            # expense credited), which would cancel out the original business
+            # activity and make the income statement show zero. Fall back to
+            # slow path which excludes CLOSING_SOURCE_TYPES.
+            has_closing = (
+                db.query(Voucher.id)
+                .filter(
+                    Voucher.ledger_id == ledger_id,
+                    Voucher.voucher_date >= start_date,
+                    Voucher.voucher_date <= end_date,
+                    Voucher.status == VoucherStatus.POSTED,
+                    Voucher.source_type.in_(CLOSING_SOURCE_TYPES),
+                )
+                .first()
+            )
+            if has_closing:
+                fast = None
     if fast is not None:
         balances = fast
     elif account_ids:
@@ -666,6 +769,9 @@ def get_income_statement(start_date: date, end_date: date, db: Session = Depends
                 Voucher.voucher_date >= start_date,
                 Voucher.voucher_date <= end_date,
                 Voucher.status == VoucherStatus.POSTED,
+                # Exclude system-generated closing vouchers — their entries
+                # would cancel out the original business entries.
+                Voucher.source_type.notin_(CLOSING_SOURCE_TYPES) | (Voucher.source_type.is_(None)),
             )
             .group_by(VoucherEntry.account_id)
             .all()
@@ -683,11 +789,11 @@ def get_income_statement(start_date: date, end_date: date, db: Session = Depends
             net = credit - debit
             if net != 0:
                 revenues.append(IncomeStatementItem(item_name=f"{account.code} {account.name}", amount=net))
-                
+
     total_revenue = sum(r.amount for r in revenues)
     total_expense = sum(e.amount for e in expenses)
     net_income = total_revenue - total_expense
-    
+
     return IncomeStatementResponse(
         revenues=revenues,
         expenses=expenses,
